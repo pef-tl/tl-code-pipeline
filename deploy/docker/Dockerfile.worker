@@ -1,0 +1,28 @@
+# Image du worker code-pipeline pour déploiement managé Mistral (build depuis
+# un miroir GitHub) ou self-hosted (build par la CI GitLab, push sur le
+# Container Registry, déploiement via le Helm chart Mistral).
+#
+# Variables d'environnement requises au boot (fournies par la plateforme en
+# managé, ou par le Helm chart / le run docker en self-hosted) :
+#   DEPLOYMENT_NAME   — requis : nom du déploiement (routage des exécutions)
+#   MISTRAL_API_KEY   — appels LLM des agents (run_agent) ; en managé, le
+#                       scheduler utilise un service account, mais les appels
+#                       modèle des activités ont besoin de cette clé (secret
+#                       workspace bindé au déploiement)
+#   GITLAB_TOKEN      — clone/push/Merge Requests sur les repos cibles GitLab
+#   APPROVAL_WEBHOOK_URL — notification des gates humaines (Slack...)
+#   PIPELINE_WORKSPACE — dossier de clone des repos cibles (défaut /tmp/...)
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir uv
+
+COPY pyproject.toml ./
+COPY apps/worker/src ./apps/worker/src
+RUN uv pip install --system .
+
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "-m", "worker.entrypoints.worker"]

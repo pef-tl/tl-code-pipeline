@@ -1,0 +1,18 @@
+# Configuration OpenSpec du pipeline lui-même (exemple) — chaque REPO CIBLE a
+# sa propre openspec/config.yaml (celle-ci decrit les deux cibles reelles).
+# La clé `context` contient les contraintes qu'un agent ne peut pas deviner
+# depuis le code.
+schema: spec-driven
+context: |
+  Pipeline multi-agents qui developpe deux repos cibles :
+  - Front "toollive-c8y" (C:\projets\toollive-c8y) : Angular 18 + Cumulocity,
+    tests Jest (`npm run test-unit`), lint eslint, branche de base `develop`.
+  - Microservice "toollive-c8y-microservice" (C:\projets\toollive-c8y-microservice) :
+    Python 3.14 + Flask + uv, tests `uv run pytest -x -q`, lint ruff,
+    branche de base `develop`.
+  La commande de test est auto-detectee par repo (voir activities/test_runner.py) ;
+  surcharger via la variable d'environnement PIPELINE_TEST_CMD si besoin.
+  Pas de nouvelle dépendance sans justification dans design.md.
+rules:
+  max_proposal_lines: 100
+  max_design_lines: 150
