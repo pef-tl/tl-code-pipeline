@@ -167,17 +167,21 @@ Deux modes (doc : *Managed deployments* / *Self-hosted*) :
 
 Dans les deux modes : `deploy/docker/Dockerfile.worker` build l'image du
 worker (`python -m worker.entrypoints.worker`), `DEPLOYMENT_NAME` sert au
-routage des exécutions, et les secrets (`MISTRAL_API_KEY` pour les appels LLM
-des agents, `GITLAB_TOKEN`, `APPROVAL_WEBHOOK_URL`) sont bindés via le Secrets
-Manager (managé) ou les secrets du cluster (self-hosted).
+routage des exécutions, `MISTRAL_API_KEY` est injectée automatiquement par le
+runtime managé (nom réservé), et les autres secrets (`GITLAB_TOKEN`,
+`APPROVAL_WEBHOOK_URL`, URLs des repos) sont bindés via le Secrets Manager
+(managé) ou les secrets du cluster (self-hosted).
 
 ### Procédure managée (repo GitHub public `pef-tl/tl-code-pipeline`)
 
 1. Créer les secrets dans **Studio > Secrets Manager** (workspace) :
-   `mistral_api_key`, `gitlab_token`, `approval_webhook_url`,
+   `gitlab_token`, `approval_webhook_url`,
    `gitlab_c8y_repo` (= `https://gitlab.toollive.bearstech.com/toollive-team/toollive-business/toollive-c8y.git`),
    `gitlab_micro_repo` (= `.../toollive-c8y-microservice.git`),
    `pipeline_workspace` (= `/tmp/pipeline-workspaces`).
+   **Ne pas créer de secret `mistral_api_key`** : `MISTRAL_API_KEY` est un nom
+   réservé du runtime managé, injecté automatiquement dans le worker (l'API
+   refuse de le binder explicitement).
 2. `export MISTRAL_API_KEY=...` puis `python scripts/deploy.py` →
    `create_deployment(name="code-pipeline", spec={"github_url": "https://github.com/pef-tl/tl-code-pipeline", "revision": "main", "backend_spec": {"type": "mistral_cloud", "dockerfile_path": "deploy/docker/Dockerfile.worker", "secrets": [...]}})`.
    Mistral Cloud clone, build et run le worker ; chaque push sur `main` redéploie.

@@ -10,12 +10,15 @@ run le worker (auth service account, pas de clé dans le repo). Chaque push
 sur la branche redéploie automatiquement.
 
 Prérequis — secrets créés dans Studio > Secrets Manager (workspace) :
-    mistral_api_key       -> clé API workspace (appels LLM des agents)
     gitlab_token          -> token GitLab des repos cibles (read/write repo, api)
     approval_webhook_url  -> webhook Slack des gates humaines
     gitlab_c8y_repo       -> https://gitlab.toollive.bearstech.com/toollive-team/toollive-business/toollive-c8y.git
     gitlab_micro_repo     -> https://gitlab.toollive.bearstech.com/toollive-team/toollive-business/toollive-c8y-microservice.git
     pipeline_workspace    -> /tmp/pipeline-workspaces
+
+Note : MISTRAL_API_KEY est un nom réservé du runtime managé — la plateforme
+l'injecte automatiquement dans le worker (service account), inutile (et
+interdit) de la binder via la liste `secrets`.
 """
 
 import argparse
@@ -26,7 +29,8 @@ from mistralai.client import Mistral
 
 # env var du worker <- référence de secret du workspace Secrets Manager
 SECRETS = [
-    ("MISTRAL_API_KEY", "secret:workspace:mistral_api_key"),
+    # MISTRAL_API_KEY est réservée : injectée automatiquement par le runtime
+    # managé, elle ne doit PAS apparaître ici (l'API la refuse).
     ("GITLAB_TOKEN", "secret:workspace:gitlab_token"),
     ("APPROVAL_WEBHOOK_URL", "secret:workspace:approval_webhook_url"),
     ("GITLAB_C8Y_REPO", "secret:workspace:gitlab_c8y_repo"),
