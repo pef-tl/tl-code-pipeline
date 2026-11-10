@@ -19,12 +19,11 @@ from datetime import timedelta
 import mistralai.workflows as workflows
 from mistralai.workflows import workflow as wf
 
+from worker.agents.definitions import MAX_DEV_ITERATIONS
+
 with wf.unsafe.imports_passed_through():
-    from worker.activities import git_tools, test_runner
-    from worker.activities.openspec_tools import archive_change, build_spec_tools
-    from worker.agents import definitions as defs
-    from worker.agents.run_agent import run_agent
-    from worker.agents.tools import build_dev_tools
+    from worker.activities import agent_runner, git_tools, test_runner
+    from worker.activities.openspec_tools import archive_change
 
 GATE_TIMEOUT = timedelta(hours=24)
 
@@ -69,9 +68,9 @@ class SpecToTests:
         # ------------------------------------------------------------------
         # 1. AGENT SPEC — skill openspec-propose : produit le change folder
         #    openspec/changes/<id>/{proposal.md, design.md, tasks.md, specs/}
-        spec = defs.spec_agent(tools=build_spec_tools(repo))
-        change_id = await run_agent(spec, request, build_spec_tools(repo))
-        change_id = change_id.strip()
+        change_id = (
+            await agent_runner.run_agent_activity("spec", request, "spec", repo)
+        ).strip()
 
         # ------------------------------------------------------------------
         # 2. GATE HUMAINE — l'humain relit proposal.md + specs/
@@ -86,12 +85,12 @@ class SpecToTests:
 
         # ------------------------------------------------------------------
         # 3. AGENT PLANNER — tasks.md -> tâches unitaires avec dépendances
-        planner = defs.planner_agent(tools=[build_spec_tools(repo)["openspec_read"]])
-        plan = await run_agent(
-            planner,
+        plan = await agent_runner.run_agent_activity(
+            "planner",
             f"Change folder: openspec/changes/{change_id}/ — retourne UNIQUEMENT "
             f"le JSON {{\"tasks\": [{{id, title, capability, files_hint, depends_on, acceptance}}]}}",
-            build_spec_tools(repo),
+            "spec",
+            repo,
         )
         tasks = json.loads(plan)["tasks"]
         by_id = {t["id"]: t for t in tasks}
@@ -107,9 +106,9 @@ class SpecToTests:
             if not ready:
                 raise RuntimeError(f"deadlock on tasks: {pending}")
 
-            results = await workflows.workflow.parallel([
-                self._run_dev_task.bind(repo, change_id, task) for task in ready
-            ])
+            results = await asyncio.gather(
+                *(self._run_dev_task(repo, change_id, task) for task in ready)
+            )
             for task, wt in zip(ready, results):
                 done.add(task["id"])
                 pending.discard(task["id"])
@@ -168,16 +167,14 @@ class SpecToTests:
     async def _run_dev_task(self, repo: str, change_id: str, task: dict) -> dict:
         """Boucle bornée dev -> tests (escalade humaine au bout de N tours)."""
         wt = await git_tools.create_worktree(repo, task["id"])
-        dev = defs.dev_agent(tools=build_dev_tools(wt["worktree"]))
-        tester = defs.tester_agent(tools=build_dev_tools(wt["worktree"]))
 
         context = (f"Change: openspec/changes/{change_id}/ (lis tasks.md, design.md, "
                    f"specs/). Ta tâche: {json.dumps(task)}")
 
-        for iteration in range(defs.MAX_DEV_ITERATIONS):
-            await run_agent(dev, context, build_dev_tools(wt["worktree"]))
+        for iteration in range(MAX_DEV_ITERATIONS):
+            await agent_runner.run_agent_activity("dev", context, "dev", wt["worktree"])
             await git_tools.commit_all(wt["worktree"], f"task {task['id']}: {task['title']}")
-            await run_agent(tester, context, build_dev_tools(wt["worktree"]))
+            await agent_runner.run_agent_activity("tester", context, "dev", wt["worktree"])
             result = await test_runner.run_tests(wt["worktree"])
             if result["passed"]:
                 return wt
@@ -185,4 +182,4 @@ class SpecToTests:
 
         raise RuntimeError(
             f"task {task['id']}: boucle non convergée après "
-            f"{defs.MAX_DEV_ITERATIONS} itérations — escalade humaine")
+            f"{MAX_DEV_ITERATIONS} itérations — escalade humaine")
