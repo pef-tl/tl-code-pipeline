@@ -11,7 +11,7 @@ context: |
     Python 3.14 + Flask + uv, tests `uv run pytest -x -q`, lint ruff,
     branche de base `develop`.
   La commande de test est auto-detectee par repo (voir activities/test_runner.py) ;
-  surcharger via la variable d'environnement PIPELINE_TEST_CMD si besoin.
+  surcharger via la variable d'environnement `pipeline_test_cmd` si besoin.
   Pas de nouvelle dépendance sans justification dans design.md.
 rules:
   max_proposal_lines: 100

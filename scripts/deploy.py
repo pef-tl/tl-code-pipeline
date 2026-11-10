@@ -9,16 +9,19 @@ Mistral Cloud clone le repo GitHub, build deploy/docker/Dockerfile.worker,
 run le worker (auth service account, pas de clé dans le repo). Chaque push
 sur la branche redéploie automatiquement.
 
+Toutes les variables d'environnement du pipeline sont en minuscules et
+portent le même nom que le secret du Secrets Manager (binding 1:1).
+
 Prérequis — secrets créés dans Studio > Secrets Manager (workspace) :
     gitlab_token          -> token GitLab des repos cibles (read/write repo, api)
-    approval_webhook_url  -> webhook Slack des gates humaines
+    approval_webhook_url  -> webhook de notification des gates humaines
     gitlab_c8y_repo       -> https://gitlab.toollive.bearstech.com/toollive-team/toollive-business/toollive-c8y.git
     gitlab_micro_repo     -> https://gitlab.toollive.bearstech.com/toollive-team/toollive-business/toollive-c8y-microservice.git
     pipeline_workspace    -> /tmp/pipeline-workspaces
 
-Note : MISTRAL_API_KEY est un nom réservé du runtime managé — la plateforme
-l'injecte automatiquement dans le worker (service account), inutile (et
-interdit) de la binder via la liste `secrets`.
+Note : `MISTRAL_API_KEY` (majuscules) est un nom réservé du runtime managé —
+la plateforme l'injecte automatiquement dans le worker (service account) ;
+le code lit `mistral_api_key` en priorité avec fallback sur ce nom réservé.
 """
 
 import argparse
@@ -29,13 +32,14 @@ from mistralai.client import Mistral
 
 # env var du worker <- référence de secret du workspace Secrets Manager
 SECRETS = [
-    # MISTRAL_API_KEY est réservée : injectée automatiquement par le runtime
-    # managé, elle ne doit PAS apparaître ici (l'API la refuse).
-    ("GITLAB_TOKEN", "secret:workspace:gitlab_token"),
-    ("APPROVAL_WEBHOOK_URL", "secret:workspace:approval_webhook_url"),
-    ("GITLAB_C8Y_REPO", "secret:workspace:gitlab_c8y_repo"),
-    ("GITLAB_MICRO_REPO", "secret:workspace:gitlab_micro_repo"),
-    ("PIPELINE_WORKSPACE", "secret:workspace:pipeline_workspace"),
+    # Noms d'env en minuscules, identiques aux noms des secrets du workspace.
+    # MISTRAL_API_KEY (majuscules) est réservée : injectée automatiquement par
+    # le runtime managé, elle ne doit PAS apparaître ici (l'API la refuse).
+    ("gitlab_token", "secret:workspace:gitlab_token"),
+    ("approval_webhook_url", "secret:workspace:approval_webhook_url"),
+    ("gitlab_c8y_repo", "secret:workspace:gitlab_c8y_repo"),
+    ("gitlab_micro_repo", "secret:workspace:gitlab_micro_repo"),
+    ("pipeline_workspace", "secret:workspace:pipeline_workspace"),
 ]
 
 
@@ -46,7 +50,8 @@ def main() -> None:
     parser.add_argument("--revision", default="main")
     args = parser.parse_args()
 
-    client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
+    client = Mistral(api_key=os.environ.get("mistral_api_key")
+                     or os.environ.get("MISTRAL_API_KEY"))
     spec = {
         "github_url": args.repo,
         "revision": args.revision,
@@ -68,7 +73,7 @@ def main() -> None:
                       "status": getattr(dep, "status", None)}, indent=2, default=str))
     print("Suivi du build/run dans Studio > Deployments, ou en polling :")
     print(f"  python -c \"import os,json;from mistralai.client import Mistral;"
-          f"c=Mistral(api_key=os.environ['MISTRAL_API_KEY']);"
+          f"c=Mistral(api_key=os.environ.get('mistral_api_key') or os.environ['MISTRAL_API_KEY']);"
           f"print(json.dumps(c.workflows.deployments.get('{args.name}').model_dump(),indent=2,default=str))\"")
 
 

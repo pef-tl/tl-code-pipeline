@@ -54,24 +54,29 @@ boucle tests bornée → fusions séquentielles → gate humaine finale → merg
 
 Détail et variables d'env : `docs/architecture.md`. La commande de test est
 auto-détectée par repo (`test_runner.py::test_cmd_for`, override
-`PIPELINE_TEST_CMD`) ; la branche de base est auto-détectée
-(`git_tools.py::base_branch`, override `PIPELINE_BASE_BRANCH`).
+`pipeline_test_cmd`) ; la branche de base est auto-détectée
+(`git_tools.py::base_branch`, override `pipeline_base_branch`).
 
 En mode cloud, `--repo` accepte une **URL GitLab** (résolue aussi via
-`GITLAB_C8Y_REPO` / `GITLAB_MICRO_REPO`) : le worker clone le repo cible
-(`git_tools.ensure_workspace`, token `GITLAB_TOKEN`), pousse
+`gitlab_c8y_repo` / `gitlab_micro_repo`) : le worker clone le repo cible
+(`git_tools.ensure_workspace`, token `gitlab_token`), pousse
 `release/<change_id>`, ouvre une **Merge Request GitLab** et la merge après
 approbation. Les repos cibles restent sur GitLab, inchangés.
 
 Gates humaines : signaux `approve`/`reject` sur le workflow
 (`@workflows.workflow.signal` + `wait_condition` dans `spec_to_tests.py`) ;
 réponse via `python scripts/approve.py <execution_id> approve|reject` ;
-notification via `open_approval` (webhook `APPROVAL_WEBHOOK_URL`).
+notification via `open_approval` (webhook `approval_webhook_url`).
 
 ## TODO à compléter
 
 - Binder le canal de notification concret (Slack incoming webhook) en secret
-  `APPROVAL_WEBHOOK_URL` du déploiement worker.
+  `approval_webhook_url` du déploiement worker.
+
+Convention : toutes les variables d'environnement du pipeline sont en
+minuscules (`gitlab_token`, `approval_webhook_url`, `pipeline_workspace`, ...)
+sauf `MISTRAL_API_KEY` (nom réservé, injecté en majuscules par le runtime
+managé — lu en fallback de `mistral_api_key`).
 - Déployer le worker : miroir GitHub public + `create_deployment` (managé,
   `deploy/docker/Dockerfile.worker`) ou CI GitLab + Helm chart (self-hosted).
   Les managed deployments ne buildent que depuis GitHub public pour l'instant.
@@ -79,7 +84,7 @@ notification via `open_approval` (webhook `APPROVAL_WEBHOOK_URL`).
 ## Démarrage
 
 ```bash
-export MISTRAL_API_KEY=...
+export mistral_api_key=...               # (fallback: MISTRAL_API_KEY en majuscules)
 uv sync                                   # installe le worker
 mistral dev                               # terminal 1 : le worker attend
 python scripts/run.py                     # terminal 2 : lance une exécution

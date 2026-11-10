@@ -101,7 +101,7 @@ Le pipeline détecte automatiquement la stack du repo passé en entrée :
 
 Détection dans `activities/test_runner.py::test_cmd_for` :
 `pyproject.toml` à la racine → pytest/uv ; `package.json` → Jest/npm ;
-sinon fallback `TEST_CMD`. Override : variable d'env `PIPELINE_TEST_CMD`.
+sinon fallback `TEST_CMD`. Override : variable d'env `pipeline_test_cmd`.
 
 Chaque repo cible a sa propre `openspec/config.yaml` avec le `context` de sa
 stack (contraintes que l'agent ne peut pas deviner depuis le code) :
@@ -116,7 +116,7 @@ stack (contraintes que l'agent ne peut pas deviner depuis le code) :
 (chemin absolu retourné par `create_worktree`), pour éviter les collisions entre
 les deux repos.
 
-**Branche de base** : `git_tools.base_branch` — env `PIPELINE_BASE_BRANCH`, sinon
+**Branche de base** : `git_tools.base_branch` — env `pipeline_base_branch`, sinon
 la première de `develop`, `main`, `master` qui existe (convention toollive :
 `develop`, même si `main`/`master` existent aussi). Le diff de review est calculé
 contre cette branche.
@@ -131,9 +131,9 @@ python scripts/run.py "<demande>" --repo https://gitlab.toollive.bearstech.com/t
 ```
 
 En mode cloud, les alias `c8y` / `micro` sont résolus via les variables
-d'env `GITLAB_C8Y_REPO` / `GITLAB_MICRO_REPO` (URL GitLab des repos cibles).
-Le worker clone alors le repo cible dans `PIPELINE_WORKSPACE` avec
-`GITLAB_TOKEN` (voir `git_tools.ensure_workspace`), pousse une branche
+d'env `gitlab_c8y_repo` / `gitlab_micro_repo` (URL GitLab des repos cibles).
+Le worker clone alors le repo cible dans `pipeline_workspace` avec
+`gitlab_token` (voir `git_tools.ensure_workspace`), pousse une branche
 `release/<change_id>`, ouvre une **Merge Request GitLab** (la gate de review
 finale = la review de la MR), et merge la MR après le signal `approve`.
 
@@ -150,7 +150,7 @@ async def on_approve(self) -> None: self.verdict = "approve"
 ```
 
 - Notification : `test_runner.open_approval` poste sur le webhook
-  `APPROVAL_WEBHOOK_URL` (Slack...) avec l'`execution_id` et la commande à taper.
+  `approval_webhook_url` (Slack...) avec l'`execution_id` et la commande à taper.
 - Réponse humaine : `python scripts/approve.py <execution_id> approve|reject`
   → `client.workflows.executions.signal_workflow_execution(execution_id, name, input)`.
   Équivalent REST : `POST /v1/workflows/executions/{id}/signals`.
@@ -163,13 +163,14 @@ Deux modes (doc : *Managed deployments* / *Self-hosted*) :
 |---|---|---|
 | Source du build | **miroir GitHub public** du repo `code-pipeline` (GitLab non supporté pour l'instant par les managed deployments) | repo **GitLab** privé, image buildée par la CI GitLab |
 | Infra | aucune — Mistral Cloud build et run (`create_deployment(name=..., spec={"github_url": ..., "backend_spec": {"type": "mistral_cloud", "dockerfile_path": "deploy/docker/Dockerfile.worker"}})`) | votre cluster K8s via le Helm chart Mistral |
-| Auth worker | service account injecté (pas de clé dans le repo) | `MISTRAL_API_KEY` + `DEPLOYMENT_NAME` (env) |
+| Auth worker | service account injecté (pas de clé dans le repo) | `mistral_api_key` + `DEPLOYMENT_NAME` (env) |
 
 Dans les deux modes : `deploy/docker/Dockerfile.worker` build l'image du
 worker (`python -m worker.entrypoints.worker`), `DEPLOYMENT_NAME` sert au
-routage des exécutions, `MISTRAL_API_KEY` est injectée automatiquement par le
-runtime managé (nom réservé), et les autres secrets (`GITLAB_TOKEN`,
-`APPROVAL_WEBHOOK_URL`, URLs des repos) sont bindés via le Secrets Manager
+routage des exécutions, `MISTRAL_API_KEY` (majuscules) est un nom réservé
+injecté automatiquement par le runtime managé — le code lit `mistral_api_key`
+en priorité avec fallback sur ce nom — et les autres secrets (`gitlab_token`,
+`approval_webhook_url`, URLs des repos) sont bindés via le Secrets Manager
 (managé) ou les secrets du cluster (self-hosted).
 
 ### Procédure managée (repo GitHub public `pef-tl/tl-code-pipeline`)
@@ -179,50 +180,55 @@ runtime managé (nom réservé), et les autres secrets (`GITLAB_TOKEN`,
    `gitlab_c8y_repo` (= `https://gitlab.toollive.bearstech.com/toollive-team/toollive-business/toollive-c8y.git`),
    `gitlab_micro_repo` (= `.../toollive-c8y-microservice.git`),
    `pipeline_workspace` (= `/tmp/pipeline-workspaces`).
-   **Ne pas créer de secret `mistral_api_key`** : `MISTRAL_API_KEY` est un nom
-   réservé du runtime managé, injecté automatiquement dans le worker (l'API
-   refuse de le binder explicitement).
-2. `export MISTRAL_API_KEY=...` puis `python scripts/deploy.py` →
+   **Ne pas binder `MISTRAL_API_KEY` (majuscules) dans la liste `secrets`** :
+   c'est un nom réservé du runtime managé, injecté automatiquement dans le
+   worker (l'API refuse de le binder explicitement). Le code lit
+   `mistral_api_key` en priorité, avec fallback sur `MISTRAL_API_KEY`.
+2. `export mistral_api_key=...` puis `python scripts/deploy.py` →
    `create_deployment(name="code-pipeline", spec={"github_url": "https://github.com/pef-tl/tl-code-pipeline", "revision": "main", "backend_spec": {"type": "mistral_cloud", "dockerfile_path": "deploy/docker/Dockerfile.worker", "secrets": [...]}})`.
    Mistral Cloud clone, build et run le worker ; chaque push sur `main` redéploie.
    Attendre le statut **Active** (Studio > Deployments).
 3. Lancer une exécution : `python scripts/run.py "<demande>" --repo c8y`
-   (l'alias lit `GITLAB_C8Y_REPO` côté client).
+   (l'alias lit `gitlab_c8y_repo` côté client).
 4. Gate humaine : notification webhook avec l'`execution_id`, puis
    `python scripts/approve.py <execution_id> approve`.
 5. Observer : Studio > Executions (history, traces), MR GitLab ouverte par le
    pipeline en fin de run.
 
 **Les repos cibles (toollive-c8y, toollive-c8y-microservice) restent sur
-GitLab** : le worker les clone via leur URL + `GITLAB_TOKEN`, pousse les
+GitLab** : le worker les clone via leur URL + `gitlab_token`, pousse les
 branches `agent/*` et `release/<change_id>`, ouvre/merge la MR via l'API
 GitLab. Aucun changement côté repos cibles.
 
 ## Variables d'environnement
 
+Convention : **toutes les variables du pipeline sont en minuscules**
+(`gitlab_token`, `pipeline_workspace`, ...). Seule exception : `MISTRAL_API_KEY`
+en majuscules, nom réservé injecté par le runtime managé (fallback de lecture).
+
 | Variable | Rôle |
 |----------|------|
-| `MISTRAL_API_KEY` | clé API (client scripts + appels LLM des agents dans le worker) |
-| `PIPELINE_REPO` | repo cible par défaut de `scripts/run.py` (défaut: `c8y`) |
-| `GITLAB_C8Y_REPO` / `GITLAB_MICRO_REPO` | URL GitLab résolues par les alias `c8y` / `micro` en mode cloud |
-| `PIPELINE_TEST_CMD` | override de la commande de test |
-| `PIPELINE_BASE_BRANCH` | override de la branche de base (défaut: auto-détection `develop`/`main`/`master`) |
-| `GITLAB_TOKEN` (ou `PIPELINE_GIT_TOKEN`) | token d'accès GitLab des repos cibles (clone/push/MR) — scopes `read_repository`, `write_repository`, `api` |
-| `APPROVAL_WEBHOOK_URL` | webhook de notification des gates (Slack incoming webhook…) |
-| `PIPELINE_WORKSPACE` | dossier de clone des repos cibles en mode URL (défaut `/tmp/pipeline-workspaces`) |
+| `mistral_api_key` (fallback `MISTRAL_API_KEY`, nom réservé injecté par le runtime managé) | clé API (scripts client + appels LLM des agents dans le worker) |
+| `pipeline_repo` | repo cible par défaut de `scripts/run.py` (défaut: `c8y`) |
+| `gitlab_c8y_repo` / `gitlab_micro_repo` | URL GitLab résolues par les alias `c8y` / `micro` en mode cloud |
+| `pipeline_test_cmd` | override de la commande de test |
+| `pipeline_base_branch` | override de la branche de base (défaut: auto-détection `develop`/`main`/`master`) |
+| `gitlab_token` (ou `pipeline_git_token`) | token d'accès GitLab des repos cibles (clone/push/MR) — scopes `read_repository`, `write_repository`, `api` |
+| `approval_webhook_url` | webhook de notification des gates (Slack incoming webhook…) |
+| `pipeline_workspace` | dossier de clone des repos cibles en mode URL (défaut `/tmp/pipeline-workspaces`) |
 | `DEPLOYMENT_NAME` | nom du déploiement worker (requis au boot ; routage des exécutions) |
 
 ## Points à brancher (TODO restants)
 
 - Choisir le canal de notification concret (Slack incoming webhook recommandé)
-  et binder `APPROVAL_WEBHOOK_URL` comme secret du déploiement.
+  et binder `approval_webhook_url` comme secret du déploiement.
 - Déployer le worker : miroir GitHub public + `create_deployment` (managé),
   ou CI GitLab + Helm chart (self-hosted). Voir *Déploiement du worker*.
 
 ## Démarrage
 
 ```bash
-export MISTRAL_API_KEY=...
+export mistral_api_key=...
 uv sync                 # installe le worker
 mistral dev             # terminal 1 : le worker attend
 python scripts/run.py "Ajouter ..." --repo c8y   # terminal 2 : lance une exécution

@@ -4,7 +4,7 @@ gate humaine finale (Merge Request) → merge → archive OpenSpec.
 
 Entrées :
     repo     : URL du repo cible (https://gitlab.com/<org>/<repo>.git — cloné
-               dans PIPELINE_WORKSPACE) OU chemin local (mode dev)
+               dans `pipeline_workspace`) OU chemin local (mode dev)
     request  : demande produit de l'humain, en langage naturel
 
 Gates humaines : le workflow enregistre deux signaux `approve` / `reject`

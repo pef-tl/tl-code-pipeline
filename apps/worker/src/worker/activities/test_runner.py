@@ -32,9 +32,9 @@ def test_cmd_for(worktree: str) -> list[str]:
       (ex. C:\\projets\\toollive-c8y-microservice)
     - repo Angular/Node (package.json à la racine) -> `npm run test-unit -- --ci`
       (ex. C:\\projets\\toollive-c8y, Jest via jest-preset-angular)
-    - override explicite : variable d'env PIPELINE_TEST_CMD
+    - override explicite : variable d'env `pipeline_test_cmd`
     """
-    override = os.environ.get("PIPELINE_TEST_CMD")
+    override = os.environ.get("pipeline_test_cmd")
     if override:
         return shlex.split(override)
     if os.path.isfile(os.path.join(worktree, "pyproject.toml")):
@@ -63,14 +63,14 @@ async def open_approval(subject: str, payload: str, execution_id: str = "") -> d
     """Notifie l'humain qu'une gate attend sa décision (signal approve/reject).
 
     Canal : webhook générique (Slack incoming webhook, Linear, ...) lu dans
-    APPROVAL_WEBHOOK_URL. Le message contient l'execution_id et la commande
+    `approval_webhook_url`. Le message contient l'execution_id et la commande
     pour répondre : `python scripts/approve.py <execution_id> approve|reject`.
     """
-    url = os.environ.get("APPROVAL_WEBHOOK_URL")
+    url = os.environ.get("approval_webhook_url")
     base = {"subject": subject, "execution_id": execution_id}
     if not url:
         return {**base, "notified": False,
-                "reason": "APPROVAL_WEBHOOK_URL non défini — notification ignorée "
+                "reason": "approval_webhook_url non défini — notification ignorée "
                           "(pense à envoyer le signal à la main)"}
     text = (
         f":bell: *Gate d'approbation — {subject}*\n"

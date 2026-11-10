@@ -4,8 +4,8 @@ worktrees isolés, commits, fusions séquentielles, push et Merge Requests.
 Chaque activité est durable : retry/backoff configurés par le décorateur,
 état préservé en cas de crash du worker.
 
-Le token d'accès au forge (GitLab...) vient de l'env GITLAB_TOKEN (ou
-PIPELINE_GIT_TOKEN) : il est injecté via http.extraHeader dans la config git
+Le token d'accès au forge (GitLab...) vient de l'env `gitlab_token` (ou
+`pipeline_git_token`) : il est injecté via http.extraHeader dans la config git
 locale du clone — jamais dans une URL loggée, jamais dans le repo.
 """
 
@@ -36,7 +36,7 @@ async def _sh(cmd: list[str], cwd: str, extra_env: dict | None = None) -> dict:
 
 
 def git_token() -> str | None:
-    return os.environ.get("GITLAB_TOKEN") or os.environ.get("PIPELINE_GIT_TOKEN")
+    return os.environ.get("gitlab_token") or os.environ.get("pipeline_git_token")
 
 
 def _auth_env() -> dict:
@@ -57,10 +57,10 @@ def is_url(repo: str) -> bool:
 
 
 async def base_branch(repo: str) -> str:
-    """Branche de base du repo cible : env PIPELINE_BASE_BRANCH, sinon la
+    """Branche de base du repo cible : env `pipeline_base_branch`, sinon la
     première de (develop, main, master) qui existe — convention toollive :
     `develop` (les deux repos ont aussi main/master, mais on merge sur develop)."""
-    env = os.environ.get("PIPELINE_BASE_BRANCH")
+    env = os.environ.get("pipeline_base_branch")
     if env:
         return env
     for candidate in ("develop", "main", "master"):
@@ -73,13 +73,13 @@ async def base_branch(repo: str) -> str:
 @workflows.activity()
 async def ensure_workspace(repo: str) -> dict:
     """Si `repo` est une URL (GitLab/GitHub), clone le repo dans un workspace
-    local (PIPELINE_WORKSPACE, défaut /tmp/pipeline-workspaces) et retourne le
+    local (`pipeline_workspace`, défaut /tmp/pipeline-workspaces) et retourne le
     chemin. Si c'est un chemin local, le retourne tel quel (mode local)."""
     if not is_url(repo):
         return {"path": repo, "url": None}
     name = repo.rstrip("/").split("/")[-1].removesuffix(".git")
     digest = hashlib.md5(repo.encode()).hexdigest()[:8]
-    root = os.environ.get("PIPELINE_WORKSPACE",
+    root = os.environ.get("pipeline_workspace",
                           os.path.join(tempfile.gettempdir(), "pipeline-workspaces"))
     dest = os.path.join(root, f"{name}-{digest}")
     if os.path.isdir(os.path.join(dest, ".git")):

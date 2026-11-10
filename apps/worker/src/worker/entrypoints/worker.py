@@ -10,7 +10,10 @@ import worker.workflows  # noqa: F401  (provoque l'import des définitions)
 
 
 async def main() -> None:
-    client = Mistral(api_key=os.environ.get("MISTRAL_API_KEY"))
+    # `mistral_api_key` en priorité ; fallback sur MISTRAL_API_KEY (nom réservé
+    # injecté en majuscules par le runtime managé Mistral Cloud).
+    client = Mistral(api_key=os.environ.get("mistral_api_key")
+                     or os.environ.get("MISTRAL_API_KEY"))
 
     workflow_classes = workflows.discover_all_workflows_in_package("worker.workflows")
     await client.workflows.run_worker(workflow_classes)

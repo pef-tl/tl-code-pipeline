@@ -8,8 +8,8 @@ Exemples :
     python scripts/run.py "Exposer le statut OEM dans le microservice" --repo micro
     python scripts/run.py "..." --repo https://gitlab.toollive.bearstech.com/toollive-team/toollive-business/toollive-c8y.git
 
-En mode cloud, les alias c8y/micro sont résolus via GITLAB_C8Y_REPO /
-GITLAB_MICRO_REPO (URL GitLab, ex. https://gitlab.toollive.bearstech.com/
+En mode cloud, les alias c8y/micro sont résolus via `gitlab_c8y_repo` /
+`gitlab_micro_repo` (URL GitLab, ex. https://gitlab.toollive.bearstech.com/
 toollive-team/toollive-business/toollive-c8y.git). Répondre aux gates avec :
     python scripts/approve.py <execution_id> approve|reject
 """
@@ -21,11 +21,11 @@ import os
 from mistralai.client import Mistral
 
 # Alias des repos cibles. En mode cloud, pointer vers les URL GitLab via les
-# variables d'env GITLAB_C8Y_REPO / GITLAB_MICRO_REPO (le worker clone alors le
-# repo avec GITLAB_TOKEN). En local, les chemins par défaut fonctionnent tels quels.
+# variables d'env `gitlab_c8y_repo` / `gitlab_micro_repo` (le worker clone alors le
+# repo avec `gitlab_token`). En local, les chemins par défaut fonctionnent tels quels.
 REPOS = {
-    "c8y": os.environ.get("GITLAB_C8Y_REPO", r"C:\projets\toollive-c8y"),
-    "micro": os.environ.get("GITLAB_MICRO_REPO", r"C:\projets\toollive-c8y-microservice"),
+    "c8y": os.environ.get("gitlab_c8y_repo", r"C:\projets\toollive-c8y"),
+    "micro": os.environ.get("gitlab_micro_repo", r"C:\projets\toollive-c8y-microservice"),
 }
 
 
@@ -34,13 +34,16 @@ def main() -> None:
     parser.add_argument("request", help="demande produit, en langage naturel")
     parser.add_argument(
         "--repo",
-        default=os.environ.get("PIPELINE_REPO", "c8y"),
+        default=os.environ.get("pipeline_repo", "c8y"),
         help="alias 'c8y' / 'micro', ou chemin absolu du repo cible (défaut: c8y)",
     )
     args = parser.parse_args()
     repo = REPOS.get(args.repo, args.repo)
 
-    client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
+    # `mistral_api_key` en priorité ; fallback MISTRAL_API_KEY (nom réservé,
+    # injecté en majuscules par le runtime managé).
+    client = Mistral(api_key=os.environ.get("mistral_api_key")
+                     or os.environ.get("MISTRAL_API_KEY"))
     execution = client.workflows.execute_workflow(
         workflow_identifier="spec-to-tests",
         input={"repo": repo, "request": args.request},

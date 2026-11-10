@@ -30,7 +30,7 @@ Humain ──► agent Spec (OpenSpec) ──► GATE: approbation du proposal
 
 ```bash
 # 1. Prérequis
-#    - clé API exportée: export MISTRAL_API_KEY=...
+#    - clé API exportée: export mistral_api_key=...   (fallback: MISTRAL_API_KEY)
 #    - Mistral CLI: https://docs.mistral.ai/studio/mistral-cli/quickstart
 #    - uv, git
 
@@ -48,7 +48,7 @@ mistral dev
 python scripts/run.py "Ajouter ..." --repo c8y     # front Angular toollive-c8y
 python scripts/run.py "Ajouter ..." --repo micro   # microservice Python
 # mode cloud (repos cibles sur GitLab) :
-#   export GITLAB_C8Y_REPO=https://gitlab.com/<org>/toollive-c8y.git
+#   export gitlab_c8y_repo=https://gitlab.com/<org>/toollive-c8y.git
 #   python scripts/run.py "Ajouter ..." --repo c8y
 
 # 6. Répondre aux gates humaines (notification Slack/webhook avec l'execution_id) :
@@ -72,8 +72,9 @@ Deux repos sont configurés (détail dans `docs/architecture.md`) :
   lint `uv run ruff check`, branche de base `develop`.
 
 La commande de test est auto-détectée selon le repo (override :
-`PIPELINE_TEST_CMD`), la branche de base aussi (override :
-`PIPELINE_BASE_BRANCH`).
+`pipeline_test_cmd`), la branche de base aussi (override :
+`pipeline_base_branch`). Toutes les variables d'env du pipeline sont en
+minuscules.
 
 ## Points clés
 

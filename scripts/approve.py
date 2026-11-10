@@ -22,7 +22,9 @@ def main() -> None:
     parser.add_argument("verdict", choices=["approve", "reject"])
     args = parser.parse_args()
 
-    client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
+    # `mistral_api_key` en priorité ; fallback MISTRAL_API_KEY (nom réservé).
+    client = Mistral(api_key=os.environ.get("mistral_api_key")
+                     or os.environ.get("MISTRAL_API_KEY"))
     client.workflows.executions.signal_workflow_execution(
         execution_id=args.execution_id,
         name=args.verdict,
