@@ -19,11 +19,12 @@ from datetime import timedelta
 import mistralai.workflows as workflows
 from mistralai.workflows import workflow as wf
 
-from worker.activities import git_tools, test_runner
-from worker.activities.openspec_tools import archive_change, build_spec_tools
-from worker.agents import definitions as defs
-from worker.agents.run_agent import run_agent
-from worker.agents.tools import build_dev_tools
+with wf.unsafe.imports_passed_through():
+    from worker.activities import git_tools, test_runner
+    from worker.activities.openspec_tools import archive_change, build_spec_tools
+    from worker.agents import definitions as defs
+    from worker.agents.run_agent import run_agent
+    from worker.agents.tools import build_dev_tools
 
 GATE_TIMEOUT = timedelta(hours=24)
 
