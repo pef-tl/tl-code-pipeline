@@ -171,6 +171,24 @@ routage des exécutions, et les secrets (`MISTRAL_API_KEY` pour les appels LLM
 des agents, `GITLAB_TOKEN`, `APPROVAL_WEBHOOK_URL`) sont bindés via le Secrets
 Manager (managé) ou les secrets du cluster (self-hosted).
 
+### Procédure managée (repo GitHub public `pef-tl/tl-code-pipeline`)
+
+1. Créer les secrets dans **Studio > Secrets Manager** (workspace) :
+   `mistral_api_key`, `gitlab_token`, `approval_webhook_url`,
+   `gitlab_c8y_repo` (= `https://gitlab.toollive.bearstech.com/toollive-team/toollive-business/toollive-c8y.git`),
+   `gitlab_micro_repo` (= `.../toollive-c8y-microservice.git`),
+   `pipeline_workspace` (= `/tmp/pipeline-workspaces`).
+2. `export MISTRAL_API_KEY=...` puis `python scripts/deploy.py` →
+   `create_deployment(name="code-pipeline", spec={"github_url": "https://github.com/pef-tl/tl-code-pipeline", "revision": "main", "backend_spec": {"type": "mistral_cloud", "dockerfile_path": "deploy/docker/Dockerfile.worker", "secrets": [...]}})`.
+   Mistral Cloud clone, build et run le worker ; chaque push sur `main` redéploie.
+   Attendre le statut **Active** (Studio > Deployments).
+3. Lancer une exécution : `python scripts/run.py "<demande>" --repo c8y`
+   (l'alias lit `GITLAB_C8Y_REPO` côté client).
+4. Gate humaine : notification webhook avec l'`execution_id`, puis
+   `python scripts/approve.py <execution_id> approve`.
+5. Observer : Studio > Executions (history, traces), MR GitLab ouverte par le
+   pipeline en fin de run.
+
 **Les repos cibles (toollive-c8y, toollive-c8y-microservice) restent sur
 GitLab** : le worker les clone via leur URL + `GITLAB_TOKEN`, pousse les
 branches `agent/*` et `release/<change_id>`, ouvre/merge la MR via l'API
