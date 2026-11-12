@@ -24,8 +24,10 @@ from mistralai.client import Mistral
 # variables d'env `gitlab_c8y_repo` / `gitlab_micro_repo` (le worker clone alors le
 # repo avec `gitlab_token`). En local, les chemins par défaut fonctionnent tels quels.
 REPOS = {
-    "c8y": os.environ.get("gitlab_c8y_repo", r"C:\projets\toollive-c8y"),
-    "micro": os.environ.get("gitlab_micro_repo", r"C:\projets\toollive-c8y-microservice"),
+    "c8y": (os.environ.get("gitlab_c8y_repo") or os.environ.get("GITLAB_C8Y_REPO")
+            or r"C:\projets\toollive-c8y"),
+    "micro": (os.environ.get("gitlab_micro_repo") or os.environ.get("GITLAB_MICRO_REPO")
+              or r"C:\projets\toollive-c8y-microservice"),
 }
 
 
@@ -34,7 +36,8 @@ def main() -> None:
     parser.add_argument("request", help="demande produit, en langage naturel")
     parser.add_argument(
         "--repo",
-        default=os.environ.get("pipeline_repo", "c8y"),
+        default=(os.environ.get("pipeline_repo") or os.environ.get("PIPELINE_REPO")
+                 or "c8y"),
         help="alias 'c8y' / 'micro', ou chemin absolu du repo cible (défaut: c8y)",
     )
     args = parser.parse_args()

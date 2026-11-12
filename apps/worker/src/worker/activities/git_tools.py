@@ -39,8 +39,19 @@ async def _sh(cmd: list[str], cwd: str, extra_env: dict | None = None) -> dict:
     return {"code": proc.returncode, "output": out.decode(errors="replace")}
 
 
+def _env(*names: str) -> str | None:
+    """Première variable d'env non vide parmi `names` — convention minuscule,
+    avec fallback sur l'ancien nom en majuscules (tolère les déploiements
+    créés avant la convention minuscules)."""
+    for n in names:
+        val = os.environ.get(n)
+        if val:
+            return val
+    return None
+
+
 def git_token() -> str | None:
-    return os.environ.get("gitlab_token") or os.environ.get("pipeline_git_token")
+    return _env("gitlab_token", "GITLAB_TOKEN", "pipeline_git_token", "PIPELINE_GIT_TOKEN")
 
 
 def _auth_header() -> str:
@@ -53,14 +64,17 @@ def _auth_header() -> str:
 
 def _auth_env() -> dict:
     """Env git transient (GIT_CONFIG_*) pour authentifier clone/fetch/push
-    sans mettre le token dans l'URL ni dans la ligne de commande."""
-    if not git_token():
-        return {}
-    return {
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "http.extraHeader",
-        "GIT_CONFIG_VALUE_0": _auth_header(),
-    }
+    sans mettre le token dans l'URL ni dans la ligne de commande.
+    GIT_TERMINAL_PROMPT=0 : jamais de prompt interactif dans le conteneur
+    (échec immédiat et clair si le token manque)."""
+    env = {"GIT_TERMINAL_PROMPT": "0"}
+    if git_token():
+        env.update({
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.extraHeader",
+            "GIT_CONFIG_VALUE_0": _auth_header(),
+        })
+    return env
 
 
 def is_url(repo: str) -> bool:
@@ -84,7 +98,7 @@ async def base_branch(repo: str) -> str:
     """Branche de base du repo cible : env `pipeline_base_branch`, sinon la
     première de (develop, main, master) qui existe — convention toollive :
     `develop` (les deux repos ont aussi main/master, mais on merge sur develop)."""
-    env = os.environ.get("pipeline_base_branch")
+    env = _env("pipeline_base_branch", "PIPELINE_BASE_BRANCH")
     if env:
         return env
     for candidate in ("develop", "main", "master"):
@@ -104,8 +118,8 @@ async def ensure_workspace(repo: str) -> dict:
     repo = normalize_repo_url(repo)   # SSH -> HTTPS (pas de clé SSH dans le worker)
     name = repo.rstrip("/").split("/")[-1].removesuffix(".git")
     digest = hashlib.md5(repo.encode()).hexdigest()[:8]
-    root = os.environ.get("pipeline_workspace",
-                          os.path.join(tempfile.gettempdir(), "pipeline-workspaces"))
+    root = _env("pipeline_workspace", "PIPELINE_WORKSPACE") \
+        or os.path.join(tempfile.gettempdir(), "pipeline-workspaces")
     dest = os.path.join(root, f"{name}-{digest}")
     if os.path.isdir(os.path.join(dest, ".git")):
         await _sh(["git", "fetch", "origin"], dest, extra_env=_auth_env())
@@ -115,7 +129,10 @@ async def ensure_workspace(repo: str) -> dict:
         os.makedirs(root, exist_ok=True)
         res = await _sh(["git", "clone", repo, dest], root, extra_env=_auth_env())
         if res["code"] != 0:
-            raise RuntimeError(f"clone failed: {res['output']}")
+            hint = ("" if git_token() else
+                    " — gitlab_token ABSENT du worker : vérifier le binding du secret "
+                    "dans le déploiement (re-run python scripts/deploy.py)")
+            raise RuntimeError(f"clone failed: {res['output']}{hint}")
         await _sh(["git", "checkout", "-f", await base_branch(dest)], dest)
     # Le token persiste dans .git/config du workspace (pas dans le remote URL) :
     if git_token():

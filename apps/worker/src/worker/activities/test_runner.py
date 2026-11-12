@@ -35,7 +35,8 @@ def test_cmd_for(worktree: str) -> list[str]:
       (ex. C:\\projets\\toollive-c8y, Jest via jest-preset-angular)
     - override explicite : variable d'env `pipeline_test_cmd`
     """
-    override = os.environ.get("pipeline_test_cmd")
+    override = (os.environ.get("pipeline_test_cmd")
+                or os.environ.get("PIPELINE_TEST_CMD"))
     if override:
         return shlex.split(override)
     if os.path.isfile(os.path.join(worktree, "pyproject.toml")):
@@ -96,7 +97,8 @@ async def open_approval(subject: str, payload: str, execution_id: str = "") -> d
     `approval_webhook_url`. Le message contient l'execution_id et la commande
     pour répondre : `python scripts/approve.py <execution_id> approve|reject`.
     """
-    url = os.environ.get("approval_webhook_url")
+    url = (os.environ.get("approval_webhook_url")
+           or os.environ.get("APPROVAL_WEBHOOK_URL"))
     base = {"subject": subject, "execution_id": execution_id}
     if not url:
         return {**base, "notified": False,

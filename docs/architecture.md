@@ -239,8 +239,10 @@ GitLab. Aucun changement côté repos cibles.
 ## Variables d'environnement
 
 Convention : **toutes les variables du pipeline sont en minuscules**
-(`gitlab_token`, `pipeline_workspace`, ...). Seule exception : `MISTRAL_API_KEY`
-en majuscules, nom réservé injecté par le runtime managé (fallback de lecture).
+(`gitlab_token`, `pipeline_workspace`, ...). Le code tolère aussi l'ancien
+nom en majuscules en fallback (`GITLAB_TOKEN`, ...) pour les déploiements
+créés avant la convention. Seule exception stricte : `MISTRAL_API_KEY`
+en majuscules, nom réservé injecté par le runtime managé.
 
 | Variable | Rôle |
 |----------|------|
