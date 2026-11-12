@@ -137,6 +137,14 @@ Le worker clone alors le repo cible dans `pipeline_workspace` avec
 `release/<change_id>`, ouvre une **Merge Request GitLab** (la gate de review
 finale = la review de la MR), et merge la MR après le signal `approve`.
 
+**Auth forge** : le worker n'a pas de clé SSH (conteneur managé) — les URL
+SSH (`git@host:...`, `ssh://git@host/...`) sont automatiquement normalisées
+en `https://host/...` (`git_tools.normalize_repo_url`) et le clone/push
+passe par le PAT en Basic auth (`http.extraHeader`, username `oauth2`, doc
+GitLab : tout username non vide + PAT en mot de passe). L'API REST (MR) prend
+le même token en `Authorization: Bearer`. Le token n'apparaît jamais dans
+une URL loggée. Scopes du PAT : `read_repository`, `write_repository`, `api`.
+
 ## Interaction humaine avec le workflow (signaux + query)
 
 Le workflow `SpecToTests` expose **3 signaux** et **1 query** ; il dort sur

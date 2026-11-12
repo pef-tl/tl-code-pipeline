@@ -5,13 +5,17 @@ Chaque activité est durable : retry/backoff configurés par le décorateur,
 état préservé en cas de crash du worker.
 
 Le token d'accès au forge (GitLab...) vient de l'env `gitlab_token` (ou
-`pipeline_git_token`) : il est injecté via http.extraHeader dans la config git
-locale du clone — jamais dans une URL loggée, jamais dans le repo.
+`pipeline_git_token`). Le worker n'a PAS de clé SSH (conteneur managé) :
+les URL SSH (`git@host:...`, `ssh://...`) sont normalisées en HTTPS et le
+token est envoyé en Basic auth via http.extraHeader (doc GitLab : n'importe
+quel username non vide + PAT en mot de passe) — jamais dans une URL loggée.
+L'API REST GitLab, elle, prend le token en `Authorization: Bearer`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -39,21 +43,41 @@ def git_token() -> str | None:
     return os.environ.get("gitlab_token") or os.environ.get("pipeline_git_token")
 
 
+def _auth_header() -> str:
+    """Header d'auth git over HTTPS : Basic avec le PAT en mot de passe et
+    `oauth2` comme username (doc GitLab : tout username non vide convient)."""
+    token = git_token()
+    cred = base64.b64encode(f"oauth2:{token}".encode()).decode()
+    return f"Authorization: Basic {cred}"
+
+
 def _auth_env() -> dict:
     """Env git transient (GIT_CONFIG_*) pour authentifier clone/fetch/push
     sans mettre le token dans l'URL ni dans la ligne de commande."""
-    token = git_token()
-    if not token:
+    if not git_token():
         return {}
     return {
         "GIT_CONFIG_COUNT": "1",
         "GIT_CONFIG_KEY_0": "http.extraHeader",
-        "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {token}",
+        "GIT_CONFIG_VALUE_0": _auth_header(),
     }
 
 
 def is_url(repo: str) -> bool:
-    return repo.startswith(("http://", "https://", "git@"))
+    return bool(re.match(r"^(?:https?|ssh)://|^[^@/\s]+@[^:/\s]+:", repo))
+
+
+def normalize_repo_url(repo: str) -> str:
+    """Normalise une URL git en HTTPS (le worker n'a pas de clé SSH) :
+    `git@host:group/projet.git` / `ssh://git@host[:port]/group/projet.git`
+    -> `https://host/group/projet.git`. Les http(s) passent telles quelles."""
+    if repo.startswith(("http://", "https://")):
+        return repo
+    m = re.match(r"^(?:ssh://)?[^@/\s]+@([^:/\s]+)(?::\d+)?[/:](.+)$", repo)
+    if m:
+        host, path = m.group(1), m.group(2)
+        return f"https://{host}/{path}"
+    return repo
 
 
 async def base_branch(repo: str) -> str:
@@ -77,6 +101,7 @@ async def ensure_workspace(repo: str) -> dict:
     chemin. Si c'est un chemin local, le retourne tel quel (mode local)."""
     if not is_url(repo):
         return {"path": repo, "url": None}
+    repo = normalize_repo_url(repo)   # SSH -> HTTPS (pas de clé SSH dans le worker)
     name = repo.rstrip("/").split("/")[-1].removesuffix(".git")
     digest = hashlib.md5(repo.encode()).hexdigest()[:8]
     root = os.environ.get("pipeline_workspace",
@@ -93,9 +118,8 @@ async def ensure_workspace(repo: str) -> dict:
             raise RuntimeError(f"clone failed: {res['output']}")
         await _sh(["git", "checkout", "-f", await base_branch(dest)], dest)
     # Le token persiste dans .git/config du workspace (pas dans le remote URL) :
-    token = git_token()
-    if token:
-        await _sh(["git", "config", "http.extraHeader", f"Authorization: Bearer {token}"], dest)
+    if git_token():
+        await _sh(["git", "config", "http.extraHeader", _auth_header()], dest)
     return {"path": dest, "url": repo}
 
 
@@ -159,8 +183,9 @@ async def cleanup_worktree(repo: str, worktree: str, branch: str) -> dict:
 # ------------------------------------------------------------- API GitLab ---
 
 def _gitlab_api(repo_url: str) -> tuple[str, str]:
-    """(api_base, project encodé) à partir d'une URL git.
+    """(api_base, project encodé) à partir d'une URL git (SSH normalisée en HTTPS).
     https://gitlab.com/<group>/<projet>.git -> https://gitlab.com/api/v4, <group>%2F<projet>"""
+    repo_url = normalize_repo_url(repo_url)
     m = re.match(r"https?://([^/]+)/(.+?)(?:\.git)?/?$", repo_url)
     if not m:
         raise ValueError(f"URL git non reconnue: {repo_url}")
