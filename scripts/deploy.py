@@ -13,10 +13,11 @@ Toutes les variables d'environnement du pipeline sont en minuscules et
 portent le même nom que le secret du Secrets Manager (binding 1:1).
 
 Prérequis — secrets créés dans Studio > Secrets Manager (workspace) :
-    gitlab_token          -> token GitLab des repos cibles (read/write repo, api)
+    gitlab_ssh_key        -> clé privée SSH (deploy key GitLab) pour clone/push en git@...
+    gitlab_token          -> PAT GitLab (API REST Merge Requests en Bearer)
     approval_webhook_url  -> webhook de notification des gates humaines
-    gitlab_c8y_repo       -> https://gitlab.toollive.bearstech.com/toollive-team/toollive-business/toollive-c8y.git
-    gitlab_micro_repo     -> https://gitlab.toollive.bearstech.com/toollive-team/toollive-business/toollive-c8y-microservice.git
+    gitlab_c8y_repo       -> git@gitlab.toollive.bearstech.com:toollive-team/toollive-business/toollive-c8y.git
+    gitlab_micro_repo     -> git@gitlab.toollive.bearstech.com:toollive-team/toollive-business/toollive-c8y-microservice.git
     pipeline_workspace    -> /tmp/pipeline-workspaces
 
 Note : `MISTRAL_API_KEY` (majuscules) est un nom réservé du runtime managé —
@@ -35,6 +36,7 @@ SECRETS = [
     # Noms d'env en minuscules, identiques aux noms des secrets du workspace.
     # MISTRAL_API_KEY (majuscules) est réservée : injectée automatiquement par
     # le runtime managé, elle ne doit PAS apparaître ici (l'API la refuse).
+    ("gitlab_ssh_key", "secret:workspace:gitlab_ssh_key"),
     ("gitlab_token", "secret:workspace:gitlab_token"),
     ("approval_webhook_url", "secret:workspace:approval_webhook_url"),
     ("gitlab_c8y_repo", "secret:workspace:gitlab_c8y_repo"),

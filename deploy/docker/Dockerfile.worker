@@ -10,8 +10,11 @@
 #                          managé ; le code lit `mistral_api_key` en priorité
 #                          avec fallback sur MISTRAL_API_KEY. En self-hosted,
 #                          définir `mistral_api_key`.
-#   gitlab_token         — PAT GitLab (clone/push HTTPS en Basic auth + API en
-#                          Bearer) ; scopes read_repository, write_repository, api
+#   gitlab_ssh_key       — clé privée SSH (deploy key / compte de service) pour
+#                          cloner/pusher en git@host:... (écrite 0600 au runtime)
+#   gitlab_token         — PAT GitLab (API REST en Bearer ; fallback Basic auth
+#                          pour les URL https) ; scopes read_repository,
+#                          write_repository, api
 #   approval_webhook_url — notification des gates humaines (webhook...)
 #   pipeline_workspace   — dossier de clone des repos cibles (défaut /tmp/...)
 #
@@ -21,9 +24,10 @@
 
 FROM python:3.12-slim
 
-# git (clone/push/worktrees) + certificats CA (HTTPS) + curl/xz (install Node)
+# git + client SSH (clone/push en git@... via la clé du secret gitlab_ssh_key)
+# + certificats CA (HTTPS) + curl/xz (install Node)
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates curl xz-utils \
+ && apt-get install -y --no-install-recommends git openssh-client ca-certificates curl xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
 # Node.js 20 + npm — les tests du front Angular tournent dans le worker

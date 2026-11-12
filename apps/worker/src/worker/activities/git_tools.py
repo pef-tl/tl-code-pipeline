@@ -4,12 +4,15 @@ worktrees isolés, commits, fusions séquentielles, push et Merge Requests.
 Chaque activité est durable : retry/backoff configurés par le décorateur,
 état préservé en cas de crash du worker.
 
-Le token d'accès au forge (GitLab...) vient de l'env `gitlab_token` (ou
-`pipeline_git_token`). Le worker n'a PAS de clé SSH (conteneur managé) :
-les URL SSH (`git@host:...`, `ssh://...`) sont normalisées en HTTPS et le
-token est envoyé en Basic auth via http.extraHeader (doc GitLab : n'importe
-quel username non vide + PAT en mot de passe) — jamais dans une URL loggée.
-L'API REST GitLab, elle, prend le token en `Authorization: Bearer`.
+Auth forge, selon le format de l'URL du repo (utilisée telle quelle) :
+- URL SSH (`git@host:...`, `ssh://...`) : clé privée injectée via le secret
+  `gitlab_ssh_key` — écrite dans un fichier 0600 et passée à git via
+  GIT_SSH_COMMAND / core.sshCommand (comme sur une machine de dev).
+- URL HTTPS : PAT (`gitlab_token` / `pipeline_git_token`) en Basic auth via
+  http.extraHeader (doc GitLab : tout username non vide + PAT en mot de passe).
+- API REST GitLab (Merge Requests) : même PAT en `Authorization: Bearer`.
+Dans tous les cas : jamais de credential dans une URL loggée, et
+GIT_TERMINAL_PROMPT=0 (pas de prompt interactif dans le conteneur).
 """
 
 from __future__ import annotations
@@ -62,12 +65,28 @@ def _auth_header() -> str:
     return f"Authorization: Basic {cred}"
 
 
+def _ssh_key_env() -> dict:
+    """GIT_SSH_COMMAND si une clé privée SSH est fournie via le secret
+    `gitlab_ssh_key` — clone/push en `git@...` comme sur une machine de dev.
+    La clé est écrite dans un fichier 0600 (jamais dans une URL loggée)."""
+    key = _env("gitlab_ssh_key", "GITLAB_SSH_KEY")
+    if not key:
+        return {}
+    keyfile = os.path.join(tempfile.gettempdir(), "pipeline-git-ssh-key")
+    if not os.path.exists(keyfile):
+        with open(keyfile, "w", encoding="utf-8") as fh:
+            fh.write(key if key.endswith("\n") else key + "\n")
+        os.chmod(keyfile, 0o600)
+    return {"GIT_SSH_COMMAND": (
+        f"ssh -i {keyfile} -o StrictHostKeyChecking=accept-new "
+        f"-o UserKnownHostsFile={os.devnull}")}
+
+
 def _auth_env() -> dict:
-    """Env git transient (GIT_CONFIG_*) pour authentifier clone/fetch/push
-    sans mettre le token dans l'URL ni dans la ligne de commande.
-    GIT_TERMINAL_PROMPT=0 : jamais de prompt interactif dans le conteneur
-    (échec immédiat et clair si le token manque)."""
-    env = {"GIT_TERMINAL_PROMPT": "0"}
+    """Env git transient pour clone/fetch/push : GIT_TERMINAL_PROMPT=0 (jamais
+    de prompt dans le conteneur), GIT_SSH_COMMAND (clé du secret gitlab_ssh_key)
+    et http.extraHeader Basic PAT pour les URL https."""
+    env = {"GIT_TERMINAL_PROMPT": "0", **_ssh_key_env()}
     if git_token():
         env.update({
             "GIT_CONFIG_COUNT": "1",
@@ -81,17 +100,17 @@ def is_url(repo: str) -> bool:
     return bool(re.match(r"^(?:https?|ssh)://|^[^@/\s]+@[^:/\s]+:", repo))
 
 
-def normalize_repo_url(repo: str) -> str:
-    """Normalise une URL git en HTTPS (le worker n'a pas de clé SSH) :
-    `git@host:group/projet.git` / `ssh://git@host[:port]/group/projet.git`
-    -> `https://host/group/projet.git`. Les http(s) passent telles quelles."""
-    if repo.startswith(("http://", "https://")):
-        return repo
-    m = re.match(r"^(?:ssh://)?[^@/\s]+@([^:/\s]+)(?::\d+)?[/:](.+)$", repo)
+def _parse_repo_url(repo: str) -> tuple[str, str]:
+    """(host, path) depuis une URL git quelconque :
+    https://host/group/projet.git, ssh://git@host/group/projet.git,
+    git@host:group/projet.git (scp-like)."""
+    m = re.match(r"^https?://([^/]+)/(.+?)(?:\.git)?/?$", repo)
     if m:
-        host, path = m.group(1), m.group(2)
-        return f"https://{host}/{path}"
-    return repo
+        return m.group(1), m.group(2)
+    m = re.match(r"^(?:ssh://[^@/\s]+@|[^@/\s]+@)([^:/\s]+)(?::\d+)?[/:](.+?)(?:\.git)?/?$", repo)
+    if m:
+        return m.group(1), m.group(2)
+    raise ValueError(f"URL git non reconnue: {repo}")
 
 
 async def base_branch(repo: str) -> str:
@@ -115,7 +134,6 @@ async def ensure_workspace(repo: str) -> dict:
     chemin. Si c'est un chemin local, le retourne tel quel (mode local)."""
     if not is_url(repo):
         return {"path": repo, "url": None}
-    repo = normalize_repo_url(repo)   # SSH -> HTTPS (pas de clé SSH dans le worker)
     name = repo.rstrip("/").split("/")[-1].removesuffix(".git")
     digest = hashlib.md5(repo.encode()).hexdigest()[:8]
     root = _env("pipeline_workspace", "PIPELINE_WORKSPACE") \
@@ -134,10 +152,15 @@ async def ensure_workspace(repo: str) -> dict:
                     "dans le déploiement (re-run python scripts/deploy.py)")
             raise RuntimeError(f"clone failed: {res['output']}{hint}")
         await _sh(["git", "checkout", "-f", await base_branch(dest)], dest)
-    # Le token persiste dans .git/config du workspace (pas dans le remote URL) :
+    # Les credentials persistent dans .git/config du workspace (jamais dans le
+    # remote URL) : Basic PAT pour https, core.sshCommand pour le SSH.
     if git_token():
         await _sh(["git", "config", "http.extraHeader", _auth_header()], dest)
-    return {"path": dest, "url": repo}
+    ssh_cmd = _ssh_key_env().get("GIT_SSH_COMMAND")
+    if ssh_cmd:
+        await _sh(["git", "config", "core.sshCommand", ssh_cmd], dest)
+    return {"path": dest, "url": repo, "token_present": bool(git_token()),
+            "ssh_key_present": bool(ssh_cmd)}
 
 
 @workflows.activity()
@@ -176,8 +199,10 @@ async def create_branch(repo: str, branch: str) -> dict:
 
 @workflows.activity()
 async def push_branch(repo: str, branch: str) -> dict:
-    """Push la branche courante du repo vers origin (token via .git/config)."""
-    res = await _sh(["git", "push", "-u", "origin", f"HEAD:refs/heads/{branch}"], repo)
+    """Push la branche courante du repo vers origin (auth via .git/config
+    et/ou env transient _auth_env)."""
+    res = await _sh(["git", "push", "-u", "origin", f"HEAD:refs/heads/{branch}"],
+                    repo, extra_env=_auth_env())
     if res["code"] != 0:
         raise RuntimeError(f"push {branch} failed: {res['output']}")
     return res
@@ -200,13 +225,10 @@ async def cleanup_worktree(repo: str, worktree: str, branch: str) -> dict:
 # ------------------------------------------------------------- API GitLab ---
 
 def _gitlab_api(repo_url: str) -> tuple[str, str]:
-    """(api_base, project encodé) à partir d'une URL git (SSH normalisée en HTTPS).
-    https://gitlab.com/<group>/<projet>.git -> https://gitlab.com/api/v4, <group>%2F<projet>"""
-    repo_url = normalize_repo_url(repo_url)
-    m = re.match(r"https?://([^/]+)/(.+?)(?:\.git)?/?$", repo_url)
-    if not m:
-        raise ValueError(f"URL git non reconnue: {repo_url}")
-    host, path = m.group(1), m.group(2)
+    """(api_base, project encodé) à partir d'une URL git quelconque (https, ssh,
+    scp-like git@host:path). https://gitlab.com/<group>/<projet>.git ->
+    https://gitlab.com/api/v4, <group>%2F<projet>"""
+    host, path = _parse_repo_url(repo_url)
     return f"https://{host}/api/v4", urllib.parse.quote(path, safe="")
 
 

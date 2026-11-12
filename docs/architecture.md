@@ -137,13 +137,15 @@ Le worker clone alors le repo cible dans `pipeline_workspace` avec
 `release/<change_id>`, ouvre une **Merge Request GitLab** (la gate de review
 finale = la review de la MR), et merge la MR après le signal `approve`.
 
-**Auth forge** : le worker n'a pas de clé SSH (conteneur managé) — les URL
-SSH (`git@host:...`, `ssh://git@host/...`) sont automatiquement normalisées
-en `https://host/...` (`git_tools.normalize_repo_url`) et le clone/push
-passe par le PAT en Basic auth (`http.extraHeader`, username `oauth2`, doc
-GitLab : tout username non vide + PAT en mot de passe). L'API REST (MR) prend
-le même token en `Authorization: Bearer`. Le token n'apparaît jamais dans
-une URL loggée. Scopes du PAT : `read_repository`, `write_repository`, `api`.
+**Auth forge** : l'URL du repo est utilisée **telle quelle** (pas de
+normalisation). Pour une URL SSH (`git@host:...`), le worker reçoit la clé
+privée via le secret `gitlab_ssh_key` (deploy key GitLab) : écrite dans un
+fichier 0600 au runtime et passée à git via `GIT_SSH_COMMAND` /
+`core.sshCommand` — même fonctionnement qu'une machine de dev. Pour une URL
+HTTPS, le PAT (`gitlab_token`) passe en Basic auth via `http.extraHeader`.
+L'API REST (création/merge de la MR) prend le PAT en `Authorization: Bearer`.
+Aucun credential dans une URL loggée ; `GIT_TERMINAL_PROMPT=0` dans le
+conteneur. Scopes du PAT : `read_repository`, `write_repository`, `api`.
 
 ## Interaction humaine avec le workflow (signaux + query)
 
@@ -212,8 +214,10 @@ en priorité avec fallback sur ce nom — et les autres secrets (`gitlab_token`,
 ### Procédure managée (repo GitHub public `pef-tl/tl-code-pipeline`)
 
 1. Créer les secrets dans **Studio > Secrets Manager** (workspace) :
-   `gitlab_token`, `approval_webhook_url`,
-   `gitlab_c8y_repo` (= `https://gitlab.toollive.bearstech.com/toollive-team/toollive-business/toollive-c8y.git`),
+   `gitlab_ssh_key` (clé privée SSH du deploy key GitLab),
+   `gitlab_token` (PAT, scopes `read_repository` `write_repository` `api`),
+   `approval_webhook_url`,
+   `gitlab_c8y_repo` (= `git@gitlab.toollive.bearstech.com:toollive-team/toollive-business/toollive-c8y.git`),
    `gitlab_micro_repo` (= `.../toollive-c8y-microservice.git`),
    `pipeline_workspace` (= `/tmp/pipeline-workspaces`).
    **Ne pas binder `MISTRAL_API_KEY` (majuscules) dans la liste `secrets`** :
