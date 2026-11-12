@@ -354,7 +354,7 @@ async def _gitlab_request(method: str, url: str, body: dict | None = None) -> di
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
     try:
-        with await asyncio.to_thread(urllib.request.urlopen, req, 30) as resp:
+        with await asyncio.to_thread(urllib.request.urlopen, req, timeout=30) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         return {"error": f"HTTP {exc.code}: {exc.read().decode(errors='replace')[:500]}"}
