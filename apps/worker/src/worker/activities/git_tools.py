@@ -178,6 +178,28 @@ async def base_branch(repo: str) -> str:
     return "HEAD"
 
 
+async def _forge_pat_verdict(repo: str) -> str:
+    """Diagnostic REST : valide le PAT contre l'API du forge (`GET /user`, Bearer)
+    pour dire PRÉCISÉMENT pourquoi le git over HTTPS est refusé — PAT invalide/
+    révoqué (401 de l'API aussi) vs PAT accepté mais scope `read_repository`
+    manquant pour le git. La valeur du PAT n'est jamais incluse."""
+    try:
+        host, _path = _parse_repo_url(repo)
+    except ValueError:
+        return ""
+    res = await _gitlab_request("GET", f"https://{host}/api/v4/user")
+    if "error" in res:
+        err = res["error"]
+        if err.startswith("HTTP 401") or err.startswith("HTTP 403"):
+            return (f"verdict API du forge : {err.split(':', 1)[0]} sur GET /user — le PAT est "
+                    f"invalide/révoqué côté forge ; renouveler le secret `gitlab_token` "
+                    f"(scopes read_repository/write_repository/api)")
+        return f"verdict API du forge indisponible ({err[:120]}) — PAT non vérifiable par l'API"
+    user = res.get("username") or res.get("name") or "?"
+    return (f"verdict API du forge : PAT accepté (user={user}) mais refusé par le git over "
+            f"HTTPS — scope `read_repository` manquant sur le PAT du secret `gitlab_token`")
+
+
 async def _probe_remote_auth(repo: str) -> None:
     """Sonde `git ls-remote` avec les mêmes credentials que le clone/fetch :
     échoue vite et précisément si aucun PAT n'est configuré ou si le forge
@@ -193,10 +215,11 @@ async def _probe_remote_auth(repo: str) -> None:
             f"auth git vers {repo} impossible : aucun PAT configuré — binder le secret "
             f"`gitlab_token` au déploiement (env `gitlab_token`/`GITLAB_TOKEN`) ou passer "
             f"le PAT dans l'URL du repo (https://oauth2:<PAT>@host/...git) : {out}")
+    verdict = await _forge_pat_verdict(repo)
     raise RuntimeError(
-        f"PAT refusé par le forge pour {repo} (expiré/révoqué, ou scopes "
-        f"read_repository/write_repository/api manquants — lu depuis la variable "
-        f"`{git_token_source()}`) : {out}")
+        f"PAT refusé par le forge pour {repo} (lu depuis la variable "
+        f"`{git_token_source()}`) : {out}"
+        + (f" — {verdict}" if verdict else ""))
 
 
 @workflows.activity()
@@ -335,6 +358,8 @@ async def _gitlab_request(method: str, url: str, body: dict | None = None) -> di
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         return {"error": f"HTTP {exc.code}: {exc.read().decode(errors='replace')[:500]}"}
+    except urllib.error.URLError as exc:
+        return {"error": f"URLError: {exc.reason}"}
 
 
 @workflows.activity()
