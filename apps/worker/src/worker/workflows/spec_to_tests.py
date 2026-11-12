@@ -28,17 +28,30 @@ from worker.agents.tools import build_dev_tools
 GATE_TIMEOUT = timedelta(hours=24)
 
 
+def _prefixed_line(text: str, prefix: str) -> str | None:
+    """Extrait le contenu de la première ligne commençant par `prefix`."""
+    for line in text.splitlines():
+        if line.strip().startswith(prefix):
+            return line.strip()[len(prefix):].strip()
+    return None
+
+
 @workflows.workflow.define(
     name="spec-to-tests",
     workflow_display_name="Spec → Dev → Tests",
-    workflow_description="Pipeline multi-agents: agent spec OpenSpec, gates humaines "
-                          "(signaux approve/reject), dev parallèle en worktrees, "
-                          "boucle tests bornée, fusions, Merge Request.",
+    workflow_description="Pipeline multi-agents: agent spec OpenSpec (interview "
+                          "interactif: signaux approve/reject/reply + query state), "
+                          "dev parallèle en worktrees, boucle tests bornée, "
+                          "fusions, Merge Request.",
 )
 class SpecToTests:
 
     def __init__(self) -> None:
         self.verdict: str | None = None
+        self.phase: str = "init"
+        self.pending_question: str | None = None
+        self.conversation: list[dict] = []
+        self.replies: int = 0
 
     @workflows.workflow.signal(name="approve")
     async def on_approve(self) -> None:
@@ -47,6 +60,27 @@ class SpecToTests:
     @workflows.workflow.signal(name="reject")
     async def on_reject(self) -> None:
         self.verdict = "reject"
+
+    @workflows.workflow.signal(name="reply")
+    async def on_reply(self, text: str) -> None:
+        """Message libre de l'humain, transmis à l'agent en cours (interview
+        spec...). Envoyé par `python scripts/talk.py <execution_id> "..."`."""
+        self.conversation.append({"role": "human", "text": text})
+        self.replies += 1
+
+    @workflows.workflow.query(name="state")
+    def get_state(self) -> dict:
+        """Lecture seule de l'état courant — interrogeable à tout moment :
+        `python scripts/status.py <execution_id>`."""
+        return {
+            "phase": self.phase,
+            "pending_question": self.pending_question,
+            "verdict": self.verdict,
+            "conversation": [dict(m) for m in self.conversation],
+        }
+
+    def _transcript(self) -> str:
+        return "\n".join(f"{m['role']}: {m['text']}" for m in self.conversation)
 
     async def _wait_verdict(self) -> str:
         """Dort jusqu'au prochain signal approve/reject (ou timeout 24h)."""
@@ -66,18 +100,66 @@ class SpecToTests:
         execution_id = workflows.get_execution_id()
 
         # ------------------------------------------------------------------
-        # 1. AGENT SPEC — skill openspec-propose : produit le change folder
-        #    openspec/changes/<id>/{proposal.md, design.md, tasks.md, specs/}
+        # 1. AGENT SPEC — interview interactif borné (MAX_SPEC_ROUNDS) :
+        #    l'agent pose des questions (ligne "QUESTION: ..."), le workflow
+        #    dort sur le signal `reply` (scripts/talk.py) et relance l'agent
+        #    avec la réponse. Verdict final : ligne "CHANGE_ID: <id>".
+        #    Le transcript est interrogeable à tout moment (query `state`).
+        self.phase = "spec"
         spec = defs.spec_agent(tools=build_spec_tools(repo))
-        change_id = await run_agent(spec, request, build_spec_tools(repo))
-        change_id = change_id.strip()
+        self.conversation.append({"role": "human", "text": request})
+        change_id = ""
+        round_no = 0
+        while not change_id:
+            if round_no >= defs.MAX_SPEC_ROUNDS:
+                raise RuntimeError(
+                    f"interview spec non convergé après {defs.MAX_SPEC_ROUNDS} "
+                    f"tours — escalade humaine (query `state`, signal `reject`)")
+            out = await run_agent(spec, self._transcript(), build_spec_tools(repo))
+            question = _prefixed_line(out, "QUESTION:")
+            cid = _prefixed_line(out, "CHANGE_ID:")
+            if question and not cid:
+                self.pending_question = question
+                self.conversation.append({"role": "agent", "text": question})
+                await test_runner.open_approval(
+                    subject=f"Question de l'agent spec (tour {round_no + 1})",
+                    payload=(f"{question}\n\nRéponds à l'agent : python scripts/talk.py "
+                             f"{execution_id} \"ta réponse\"\nForcer la finalisation : "
+                             f"python scripts/approve.py {execution_id} approve\n"
+                             f"Voir le transcript : python scripts/status.py {execution_id}"),
+                    execution_id=execution_id,
+                )
+                consumed = self.replies
+                try:
+                    await wf.wait_condition(
+                        lambda: self.replies > consumed or self.verdict is not None,
+                        timeout=GATE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    return {"status": "timeout_spec_interview",
+                            "conversation": self.conversation}
+                if self.verdict == "reject":
+                    return {"status": "rejected_at_spec", "change_id": None}
+                if self.verdict == "approve":
+                    # l'humain veut finaliser sans attendre la fin de l'interview
+                    self.verdict = None
+                    self.conversation.append({
+                        "role": "human",
+                        "text": "[Finalise la spec maintenant, ne pose plus de question.]",
+                    })
+                round_no += 1
+                continue
+            change_id = (cid or out.strip()).strip()
+        self.pending_question = None
+        self.conversation.append({"role": "agent", "text": f"CHANGE_ID: {change_id}"})
 
         # ------------------------------------------------------------------
         # 2. GATE HUMAINE — l'humain relit proposal.md + specs/
+        self.phase = "gate_spec"
         await test_runner.open_approval(
             subject=f"Spec à valider: {change_id}",
             payload=f"{repo}/openspec/changes/{change_id}/proposal.md — réponds "
-                    f"`approve` ou `reject` sur l'exécution {execution_id}",
+                    f"`approve` ou `reject` (python scripts/approve.py {execution_id} "
+                    f"approve|reject) ; transcript : python scripts/status.py {execution_id}",
             execution_id=execution_id,
         )
         if await self._wait_verdict() != "approve":
@@ -85,6 +167,7 @@ class SpecToTests:
 
         # ------------------------------------------------------------------
         # 3. AGENT PLANNER — tasks.md -> tâches unitaires avec dépendances
+        self.phase = "plan"
         planner = defs.planner_agent(tools=[build_spec_tools(repo)["openspec_read"]])
         plan = await run_agent(
             planner,
@@ -97,6 +180,7 @@ class SpecToTests:
 
         # ------------------------------------------------------------------
         # 4. DEV PARALLÈLE — un worktree par tâche sans dépendance mutuelle
+        self.phase = "dev"
         pending = set(by_id)
         done: set[str] = set()
         worktrees: dict[str, str] = {}
@@ -116,6 +200,7 @@ class SpecToTests:
 
         # ------------------------------------------------------------------
         # 5. FUSIONS SÉQUENTIELLES — re-run complet de la suite après chacune
+        self.phase = "merge"
         for task in tasks:
             await git_tools.merge_branch(repo, f"agent/{task['id']}")
             gate = await test_runner.run_tests(repo)
@@ -126,6 +211,7 @@ class SpecToTests:
 
         # ------------------------------------------------------------------
         # 6. GATE HUMAINE FINALE — branche release + MR GitLab + review du diff
+        self.phase = "gate_review"
         final = await test_runner.run_tests(repo)
         diff = await git_tools.diff_against_base(repo)
         base = diff["base"]
@@ -159,6 +245,7 @@ class SpecToTests:
             await git_tools.push_branch(repo, base)
 
         # 8. ARCHIVE OpenSpec — specs/ à jour, change archivé
+        self.phase = "done"
         await archive_change(repo, change_id)
         return {"status": "merged", "change_id": change_id,
                 "mr": (mr.get("mr") or {}).get("web_url"), "tests": final}

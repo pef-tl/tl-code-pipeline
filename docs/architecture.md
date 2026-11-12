@@ -137,23 +137,45 @@ Le worker clone alors le repo cible dans `pipeline_workspace` avec
 `release/<change_id>`, ouvre une **Merge Request GitLab** (la gate de review
 finale = la review de la MR), et merge la MR après le signal `approve`.
 
-## Gates humaines (signaux approve/reject)
+## Interaction humaine avec le workflow (signaux + query)
 
-Le workflow `SpecToTests` enregistre deux signaux et dort sur
+Le workflow `SpecToTests` expose **3 signaux** et **1 query** ; il dort sur
 `workflow.wait_condition` (aucun coût compute pendant l'attente) :
 
+| Canal | Côté workflow | Côté humain | Usage |
+|---|---|---|---|
+| signal `approve` / `reject` | gate de validation (proposal, review finale) | `python scripts/approve.py <execution_id> approve\|reject` | décision binaire sur une gate |
+| signal `reply` (payload `{"text": ...}`) | interview de l'agent spec : le workflow transmet le texte à l'agent et relance | `python scripts/talk.py <execution_id> "ta réponse"` | **discuter avec l'agent** (phase `spec`) |
+| query `state` | lecture seule : `phase`, `pending_question`, `verdict`, `conversation` (transcript) | `python scripts/status.py <execution_id>` | voir où en est l'exécution et lire le transcript |
+
 ```python
-@workflows.workflow.signal(name="approve")
-async def on_approve(self) -> None: self.verdict = "approve"
-# + "reject" ; attente : await wf.wait_condition(lambda: self.verdict is not None,
-#                                               timeout=timedelta(hours=24))
+@workflows.workflow.signal(name="reply")
+async def on_reply(self, text: str) -> None:
+    self.conversation.append({"role": "human", "text": text})
+    self.replies += 1
+
+@workflows.workflow.query(name="state")
+def get_state(self) -> dict:
+    return {"phase": self.phase, "pending_question": self.pending_question,
+            "verdict": self.verdict, "conversation": self.conversation}
+# attente : await wf.wait_condition(lambda: self.replies > consumed, timeout=...)
 ```
+
+Pendant la phase `spec`, l'agent peut terminer sa réponse par une ligne
+`QUESTION: ...` : le pipeline notifie le webhook, dort jusqu'au signal `reply`
+(ou `approve` pour forcer la finalisation, `reject` pour avorter), puis relance
+l'agent avec le transcript complet. Boucle bornée à `MAX_SPEC_ROUNDS = 6`.
+Quand le change folder est prêt, l'agent termine par `CHANGE_ID: <id>`.
 
 - Notification : `test_runner.open_approval` poste sur le webhook
   `approval_webhook_url` (Slack...) avec l'`execution_id` et la commande à taper.
-- Réponse humaine : `python scripts/approve.py <execution_id> approve|reject`
-  → `client.workflows.executions.signal_workflow_execution(execution_id, name, input)`.
-  Équivalent REST : `POST /v1/workflows/executions/{id}/signals`.
+- Signaux : `client.workflows.executions.signal_workflow_execution(execution_id, name, input)`
+  (REST : `POST /v1/workflows/executions/{id}/signals`).
+- Query : `client.workflows.executions.query_workflow_execution(execution_id, name="state")`
+  (REST : `POST /v1/workflows/executions/{id}/queries`).
+
+Phases exposées par la query `state` : `init → spec → gate_spec → plan → dev
+→ merge → gate_review → done`.
 
 ## Déploiement du worker (cloud)
 

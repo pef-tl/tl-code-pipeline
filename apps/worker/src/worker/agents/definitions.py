@@ -17,6 +17,7 @@ DEV_MODEL = "mistral-medium-latest"
 
 MAX_DEV_ITERATIONS = 5          # borne de la boucle dev -> tests
 MAX_AGENT_TURNS = 20            # borne de la boucle d'outils d'un agent
+MAX_SPEC_ROUNDS = 6             # borne de l'interview interactif avec l'agent spec
 
 
 @dataclass
@@ -50,8 +51,16 @@ MANDATORY WORKFLOW (skill openspec-propose):
      - tasks.md      (checklist, one checkbox per unit of work, ordered by
                       dependency; mark tasks that can run in parallel with [par])
 4. Validate with `openspec validate <change-id>` before returning.
-5. If the human request is ambiguous, ask AT MOST 3 clarifying questions,
-   then proceed with the best reasonable assumption.
+
+INTERACTION PROTOCOL — the human can talk to you while you work (the pipeline
+pauses and calls you again with their answer appended to the conversation):
+- If you need a clarification, end your reply with exactly one line:
+    QUESTION: <your question>
+  Ask at most a few questions across the whole interview, then proceed with
+  the best reasonable assumption.
+- When the change folder is complete and `openspec validate` passes, end your
+  reply with exactly one line:
+    CHANGE_ID: <change-id>
 
 Every requirement MUST include at least one WHEN/THEN scenario that a test
 could verify. No scenario, no requirement. You never write implementation code.

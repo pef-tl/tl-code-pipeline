@@ -35,7 +35,10 @@ boucle tests bornée → fusions séquentielles → gate humaine finale → merg
    = 20` (boucle d'outils). Au-delà : escalade humaine, jamais de boucle infinie.
 5. **Gates humaines** : (a) approbation du proposal OpenSpec, (b) review du
    diff final. Le workflow dort sur un signal (`approve`/`reject`) —
-   voir Waiting for Conditions dans la doc Mistral Workflows.
+   voir Waiting for Conditions dans la doc Mistral Workflows. **Interview
+   interactif** : pendant la phase spec, l'agent pose des questions
+   (signal `reply` via `scripts/talk.py`, transcript lisible via la query
+   `state` / `scripts/status.py`), boucle bornée à `MAX_SPEC_ROUNDS = 6`.
 6. **Interfaces d'abord** : le planner place les types/API partagés dans la
    première tâche ; les tâches parallèles codent contre ce contrat.
 7. **Tools confinés** : les tools shell/fichiers des agents dev sont bornés au

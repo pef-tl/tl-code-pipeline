@@ -51,8 +51,10 @@ python scripts/run.py "Ajouter ..." --repo micro   # microservice Python
 #   export gitlab_c8y_repo=https://gitlab.com/<org>/toollive-c8y.git
 #   python scripts/run.py "Ajouter ..." --repo c8y
 
-# 6. Répondre aux gates humaines (notification Slack/webhook avec l'execution_id) :
-python scripts/approve.py <execution_id> approve    # ou reject
+# 6. Interagir avec le workflow en cours (notification webhook avec l'execution_id) :
+python scripts/status.py <execution_id>                       # état + transcript de l'agent
+python scripts/talk.py <execution_id> "oui, mais sans migration"  # répondre à l'agent spec
+python scripts/approve.py <execution_id> approve               # valider une gate (ou reject)
 ```
 
 En mode cloud, le pipeline clone le repo cible GitLab, ouvre une Merge Request
