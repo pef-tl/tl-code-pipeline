@@ -70,14 +70,34 @@ def extract_url_token(repo: str) -> tuple[str, str | None]:
     return repo, None
 
 
+_TOKEN_ENV_NAMES = ("gitlab_token", "pipeline_git_token")
+
+
+def _token_from_env() -> tuple[str | None, str | None]:
+    """(PAT, nom de la variable d'env source) — recherche insensible à la casse :
+    un déploiement peut binder le secret sous `GITLAB_TOKEN` (majuscules) au lieu du
+    nom minuscules conventionnel. Le token est nettoyé (strip) : un secret copié
+    depuis un terminal peut embarquer un saut de ligne final, ce qui invaliderait le
+    credential Basic. La valeur n'est jamais logguée, seul le nom de la variable."""
+    for key, val in os.environ.items():
+        if key.lower() in _TOKEN_ENV_NAMES and val and val.strip():
+            return val.strip(), key
+    return None, None
+
+
 def git_token() -> str | None:
-    """PAT du pipeline : secret env `gitlab_token` (binding du déploiement),
-    avec fallback sur le PAT embarqué dans l'URL du repo (voir extract_url_token).
-    Le token est nettoyé (strip) : un secret copié depuis un terminal peut
-    embarquer un saut de ligne final, ce qui invaliderait le credential Basic."""
-    token = _env("gitlab_token", "GITLAB_TOKEN", "pipeline_git_token", "PIPELINE_GIT_TOKEN") \
-        or _URL_TOKEN
+    """PAT du pipeline : secret env `gitlab_token` (binding du déploiement, toute
+    casse tolérée — ex. `GITLAB_TOKEN`), avec fallback sur le PAT embarqué
+    dans l'URL du repo (voir extract_url_token)."""
+    token, _src = _token_from_env()
+    token = token or _URL_TOKEN
     return token.strip() if token else token
+
+
+def git_token_source() -> str | None:
+    """Nom de la variable d'env ayant fourni le PAT (diagnostic uniquement)."""
+    _tok, src = _token_from_env()
+    return src
 
 
 def _auth_header() -> str:
@@ -158,6 +178,27 @@ async def base_branch(repo: str) -> str:
     return "HEAD"
 
 
+async def _probe_remote_auth(repo: str) -> None:
+    """Sonde `git ls-remote` avec les mêmes credentials que le clone/fetch :
+    échoue vite et précisément si aucun PAT n'est configuré ou si le forge
+    refuse le PAT (401), au lieu d'un clone qui échoue plus tard et moins clair.
+    La valeur du PAT n'est jamais incluse dans l'erreur."""
+    res = await _sh(["git", *_auth_args(), "ls-remote", repo, "HEAD"],
+                    os.getcwd(), extra_env=_auth_env())
+    if res["code"] == 0:
+        return
+    out = res["output"]
+    if not git_token():
+        raise RuntimeError(
+            f"auth git vers {repo} impossible : aucun PAT configuré — binder le secret "
+            f"`gitlab_token` au déploiement (env `gitlab_token`/`GITLAB_TOKEN`) ou passer "
+            f"le PAT dans l'URL du repo (https://oauth2:<PAT>@host/...git) : {out}")
+    raise RuntimeError(
+        f"PAT refusé par le forge pour {repo} (expiré/révoqué, ou scopes "
+        f"read_repository/write_repository/api manquants — lu depuis la variable "
+        f"`{git_token_source()}`) : {out}")
+
+
 @workflows.activity()
 async def ensure_workspace(repo: str) -> dict:
     """Si `repo` est une URL (GitLab/GitHub), clone le repo dans un workspace
@@ -170,6 +211,7 @@ async def ensure_workspace(repo: str) -> dict:
     if url_token:
         _URL_TOKEN = url_token
     repo = normalize_repo_url(repo)   # git@... -> https://... (auth PAT, pas SSH)
+    await _probe_remote_auth(repo)
     name = repo.rstrip("/").split("/")[-1].removesuffix(".git")
     digest = hashlib.md5(repo.encode()).hexdigest()[:8]
     root = _env("pipeline_workspace", "PIPELINE_WORKSPACE") \
@@ -189,13 +231,18 @@ async def ensure_workspace(repo: str) -> dict:
                 hints.append("auth SSH inattendue (les URL git@ sont normalisées en HTTPS)")
             if "could not read Username" in out or "Authentication failed" in out \
                     or "HTTP Basic: Access denied" in out:
-                hints.append("gitlab_token absent du worker ou PAT refusé — vérifier le "
-                             "binding du secret (re-run python scripts/deploy.py) et les "
-                             "scopes read_repository/write_repository/api du PAT")
-            if not git_token():
-                hints.append("gitlab_token ABSENT du worker : soit re-run python scripts/deploy.py "
-                             "(binding du secret gitlab_token), soit passer le PAT dans l'URL du repo : "
-                             "--repo https://oauth2:<PAT>@gitlab.toollive.bearstech.com/.../....git")
+                src = git_token_source()
+                if src:
+                    hints.append(f"PAT refusé par le forge (secret lu depuis la variable "
+                                 f"`{src}`) — vérifier la valeur du secret `gitlab_token` "
+                                 f"(expiré/révoqué ?) et ses scopes read_repository/"
+                                 f"write_repository/api")
+                else:
+                    hints.append("aucun PAT trouvé dans l'env du worker (variables "
+                                 "`gitlab_token`/`GITLAB_TOKEN`/`pipeline_git_token` non "
+                                 "renseignées) — binder le secret `gitlab_token` au "
+                                 "déploiement, ou passer le PAT dans l'URL du repo : "
+                                 "--repo https://oauth2:<PAT>@gitlab.toollive.bearstech.com/.../....git")
             raise RuntimeError(f"clone failed: {out}{' — ' + ' | '.join(hints) if hints else ''}")
         await _sh(["git", "checkout", "-f", await base_branch(dest)], dest)
     # Le credential persiste dans .git/config du workspace (jamais dans le
