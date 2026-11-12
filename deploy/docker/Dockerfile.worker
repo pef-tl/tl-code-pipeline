@@ -10,15 +10,38 @@
 #                          managé ; le code lit `mistral_api_key` en priorité
 #                          avec fallback sur MISTRAL_API_KEY. En self-hosted,
 #                          définir `mistral_api_key`.
-#   gitlab_token         — clone/push/Merge Requests sur les repos cibles GitLab
+#   gitlab_token         — PAT GitLab (clone/push HTTPS en Basic auth + API en
+#                          Bearer) ; scopes read_repository, write_repository, api
 #   approval_webhook_url — notification des gates humaines (webhook...)
 #   pipeline_workspace   — dossier de clone des repos cibles (défaut /tmp/...)
+#
+# Si le GitLab cible utilise une CA privée : copier le certificat ici, ex.
+#   COPY corp-ca.crt /usr/local/share/ca-certificates/corp-ca.crt
+#   RUN update-ca-certificates
 
 FROM python:3.12-slim
 
-WORKDIR /app
+# git (clone/push/worktrees) + certificats CA (HTTPS) + curl/xz (install Node)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates curl xz-utils \
+ && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir uv
+# Node.js 20 + npm — les tests du front Angular tournent dans le worker
+# (npm run test-unit, Jest). Tarball officiel, arch-aware (amd64/arm64).
+ARG NODE_VERSION=v20.19.3
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in amd64) node_arch=x64 ;; arm64) node_arch=arm64 ;; *) echo "arch $arch non supportée" >&2; exit 1 ;; esac; \
+    curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-${node_arch}.tar.xz" \
+      | tar -xJ -C /usr/local --strip-components=1; \
+    node --version; npm --version
+
+# CLI OpenSpec (l'agent spec exécute `openspec list/validate/...`) + uv
+# (microservice Python : uv sync / uv run pytest / uv run ruff)
+RUN npm install -g @fission-ai/openspec@1.13.0 \
+ && pip install --no-cache-dir uv
+
+WORKDIR /app
 
 COPY pyproject.toml ./
 COPY apps/worker/src ./apps/worker/src

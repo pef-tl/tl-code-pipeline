@@ -22,6 +22,7 @@ import mistralai.workflows as workflows
 
 TEST_CMD = ["pytest", "-x", "-q"]       # fallback si la stack n'est pas détectée
 TEST_TIMEOUT_SECONDS = 1800             # la suite Jest d'un gros front peut être longue
+DEP_TIMEOUT_SECONDS = 1800              # npm ci / uv sync sur un clone frais
 REVIEW_TIMEOUT_SECONDS = 24 * 3600     # la gate humaine attend jusqu'à 24h
 
 
@@ -44,18 +45,47 @@ def test_cmd_for(worktree: str) -> list[str]:
     return TEST_CMD
 
 
-@workflows.activity()
-async def run_tests(worktree: str) -> dict:
-    cmd = test_cmd_for(worktree)
-    if os.name == "nt" and cmd[0] in ("npm", "npx", "ng"):
-        cmd = ["cmd", "/c", *cmd]      # npm/ng sont des .cmd sous Windows
+async def _run_logged(cmd: list[str], cwd: str, timeout: int) -> dict:
+    if os.name == "nt" and cmd[0] in ("npm", "npx", "ng", "uv"):
+        cmd = ["cmd", "/c", *cmd]      # npm/ng/uv sont des .cmd sous Windows
     proc = await asyncio.create_subprocess_exec(
-        *cmd, cwd=worktree,
+        *cmd, cwd=cwd,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
-    out, _ = await asyncio.wait_for(proc.communicate(), timeout=TEST_TIMEOUT_SECONDS)
+    out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     return {"passed": proc.returncode == 0, "cmd": " ".join(cmd),
             "log": out.decode(errors="replace")}
+
+
+async def ensure_deps(worktree: str) -> dict:
+    """Installe les dépendances d'un clone frais (le worker clone à vide) :
+    - package.json sans node_modules -> `npm ci` (fallback `npm install`)
+    - pyproject.toml sans .venv      -> `uv sync`
+    Helper interne (appelé par run_tests), pas une activité séparée.
+    """
+    logs = []
+    if (os.path.isfile(os.path.join(worktree, "package.json"))
+            and not os.path.isdir(os.path.join(worktree, "node_modules"))):
+        res = await _run_logged(["npm", "ci", "--no-audit", "--no-fund"],
+                                worktree, DEP_TIMEOUT_SECONDS)
+        if not res["passed"]:    # lockfile absent ou incompatible -> install
+            res2 = await _run_logged(["npm", "install", "--no-audit", "--no-fund"],
+                                     worktree, DEP_TIMEOUT_SECONDS)
+            res = res2 if res2["passed"] else res
+        logs.append(res["log"][-2000:])
+    if (os.path.isfile(os.path.join(worktree, "pyproject.toml"))
+            and not os.path.isdir(os.path.join(worktree, ".venv"))):
+        res = await _run_logged(["uv", "sync"], worktree, DEP_TIMEOUT_SECONDS)
+        logs.append(res["log"][-2000:])
+    return {"log": "\n".join(logs)}
+
+
+@workflows.activity()
+async def run_tests(worktree: str) -> dict:
+    deps = await ensure_deps(worktree)
+    result = await _run_logged(test_cmd_for(worktree), worktree, TEST_TIMEOUT_SECONDS)
+    result["log"] = (deps["log"] + "\n" + result["log"]) if deps["log"] else result["log"]
+    return result
 
 
 @workflows.activity()

@@ -196,7 +196,13 @@ Deux modes (doc : *Managed deployments* / *Self-hosted*) :
 | Auth worker | service account injecté (pas de clé dans le repo) | `mistral_api_key` + `DEPLOYMENT_NAME` (env) |
 
 Dans les deux modes : `deploy/docker/Dockerfile.worker` build l'image du
-worker (`python -m worker.entrypoints.worker`), `DEPLOYMENT_NAME` sert au
+worker (`python -m worker.entrypoints.worker`). L'image embarque tout
+l'outillage des activités : **git**, certificats CA, **Node.js 20 + npm**
+(suite Jest du front), **uv** (microservice Python) et le **CLI OpenSpec**
+(`@fission-ai/openspec`, pour l'agent spec). `run_tests` appelle d'abord
+`ensure_deps` : `npm ci` (fallback `npm install`) si `node_modules` manque,
+`uv sync` si `.venv` manque — un clone frais est directement testable.
+`DEPLOYMENT_NAME` sert au
 routage des exécutions, `MISTRAL_API_KEY` (majuscules) est un nom réservé
 injecté automatiquement par le runtime managé — le code lit `mistral_api_key`
 en priorité avec fallback sur ce nom — et les autres secrets (`gitlab_token`,
