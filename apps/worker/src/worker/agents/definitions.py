@@ -142,3 +142,14 @@ def tester_agent(tools: list) -> AgentSpec:
 
 def reviewer_agent(tools: list) -> AgentSpec:
     return AgentSpec("reviewer-agent", SPEC_MODEL, REVIEWER_INSTRUCTIONS, tools=tools)
+
+
+# Registre nom -> factory : le workflow ne passe que le NOM de l'agent à
+# l'activity (un objet Agent ne traverse pas Temporal), qui le reconstruit ici.
+AGENT_FACTORIES = {
+    "spec": spec_agent,
+    "planner": planner_agent,
+    "dev": dev_agent,
+    "tester": tester_agent,
+    "reviewer": reviewer_agent,
+}
