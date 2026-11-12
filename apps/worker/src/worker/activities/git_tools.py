@@ -10,6 +10,11 @@ Auth forge — 100% PAT (`gitlab_token` / `pipeline_git_token`), pas de clé SSH
   auth via http.extraHeader (doc GitLab : tout username non vide + PAT en mot
   de passe) — jamais dans une URL loggée.
 - API REST GitLab (Merge Requests) : même PAT en `Authorization: Bearer`.
+- Fallback si le secret n'est pas bindé au déploiement : le PAT peut être
+  embarqué dans l'URL du repo passée à l'exécution
+  (`https://oauth2:<PAT>@gitlab.../....git`) — il est extrait, jamais loggué,
+  et retiré de l'URL avant le clone (le clone se fait sur l'URL nettoyée +
+  http.extraHeader).
 Dans tous les cas : GIT_TERMINAL_PROMPT=0 (pas de prompt interactif dans le
 conteneur) et hints guidés si un credential manque.
 """
@@ -52,8 +57,24 @@ def _env(*names: str) -> str | None:
     return None
 
 
+_URL_TOKEN: str | None = None  # PAT extrait d'une URL `https://user:pass@...` passée en entrée
+
+
+def extract_url_token(repo: str) -> tuple[str, str | None]:
+    """Si l'URL embarque des credentials (`https://user:pass@host/...`), renvoie
+    (URL nettoyée, pass). Sinon (repo, None). Le token n'est jamais loggué :
+    on clone l'URL nettoyée avec http.extraHeader."""
+    m = re.match(r"^(https?://)[^@/\s]+:([^@/\s]+)@(.+)$", repo)
+    if m:
+        return f"{m.group(1)}{m.group(3)}", m.group(2)
+    return repo, None
+
+
 def git_token() -> str | None:
-    return _env("gitlab_token", "GITLAB_TOKEN", "pipeline_git_token", "PIPELINE_GIT_TOKEN")
+    """PAT du pipeline : secret env `gitlab_token` (binding du déploiement),
+    avec fallback sur le PAT embarqué dans l'URL du repo (voir extract_url_token)."""
+    return _env("gitlab_token", "GITLAB_TOKEN", "pipeline_git_token", "PIPELINE_GIT_TOKEN") \
+        or _URL_TOKEN
 
 
 def _auth_header() -> str:
@@ -100,7 +121,7 @@ def _parse_repo_url(repo: str) -> tuple[str, str]:
     """(host, path) depuis une URL git quelconque :
     https://host/group/projet.git, ssh://git@host/group/projet.git,
     git@host:group/projet.git (scp-like)."""
-    m = re.match(r"^https?://([^/]+)/(.+?)(?:\.git)?/?$", repo)
+    m = re.match(r"^https?://(?:[^@/\s]+@)?([^/]+)/(.+?)(?:\.git)?/?$", repo)
     if m:
         return m.group(1), m.group(2)
     m = re.match(r"^(?:ssh://[^@/\s]+@|[^@/\s]+@)([^:/\s]+)(?::\d+)?[/:](.+?)(?:\.git)?/?$", repo)
@@ -128,8 +149,12 @@ async def ensure_workspace(repo: str) -> dict:
     """Si `repo` est une URL (GitLab/GitHub), clone le repo dans un workspace
     local (`pipeline_workspace`, défaut /tmp/pipeline-workspaces) et retourne le
     chemin. Si c'est un chemin local, le retourne tel quel (mode local)."""
+    global _URL_TOKEN
     if not is_url(repo):
         return {"path": repo, "url": None}
+    repo, url_token = extract_url_token(repo)  # PAT embarqué dans l'URL (jamais loggué)
+    if url_token:
+        _URL_TOKEN = url_token
     repo = normalize_repo_url(repo)   # git@... -> https://... (auth PAT, pas SSH)
     name = repo.rstrip("/").split("/")[-1].removesuffix(".git")
     digest = hashlib.md5(repo.encode()).hexdigest()[:8]
@@ -154,8 +179,9 @@ async def ensure_workspace(repo: str) -> dict:
                              "binding du secret (re-run python scripts/deploy.py) et les "
                              "scopes read_repository/write_repository/api du PAT")
             if not git_token():
-                hints.append("gitlab_token ABSENT du worker : re-run python scripts/deploy.py "
-                             "après avoir créé le secret gitlab_token dans Studio > Secrets Manager")
+                hints.append("gitlab_token ABSENT du worker : soit re-run python scripts/deploy.py "
+                             "(binding du secret gitlab_token), soit passer le PAT dans l'URL du repo : "
+                             "--repo https://oauth2:<PAT>@gitlab.toollive.bearstech.com/.../....git")
             raise RuntimeError(f"clone failed: {out}{' — ' + ' | '.join(hints) if hints else ''}")
         await _sh(["git", "checkout", "-f", await base_branch(dest)], dest)
     # Le credential persiste dans .git/config du workspace (jamais dans le
