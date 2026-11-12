@@ -4,15 +4,14 @@ worktrees isolés, commits, fusions séquentielles, push et Merge Requests.
 Chaque activité est durable : retry/backoff configurés par le décorateur,
 état préservé en cas de crash du worker.
 
-Auth forge, selon le format de l'URL du repo (utilisée telle quelle) :
-- URL SSH (`git@host:...`, `ssh://...`) : clé privée injectée via le secret
-  `gitlab_ssh_key` — écrite dans un fichier 0600 et passée à git via
-  GIT_SSH_COMMAND / core.sshCommand (comme sur une machine de dev).
-- URL HTTPS : PAT (`gitlab_token` / `pipeline_git_token`) en Basic auth via
-  http.extraHeader (doc GitLab : tout username non vide + PAT en mot de passe).
+Auth forge — 100% PAT (`gitlab_token` / `pipeline_git_token`), pas de clé SSH :
+- Opérations git (clone/push) : les URL SSH (`git@host:...`, `ssh://...`) sont
+  converties en HTTPS (`normalize_repo_url`) et le PAT est envoyé en Basic
+  auth via http.extraHeader (doc GitLab : tout username non vide + PAT en mot
+  de passe) — jamais dans une URL loggée.
 - API REST GitLab (Merge Requests) : même PAT en `Authorization: Bearer`.
-Dans tous les cas : jamais de credential dans une URL loggée, et
-GIT_TERMINAL_PROMPT=0 (pas de prompt interactif dans le conteneur).
+Dans tous les cas : GIT_TERMINAL_PROMPT=0 (pas de prompt interactif dans le
+conteneur) et hints guidés si un credential manque.
 """
 
 from __future__ import annotations
@@ -65,29 +64,11 @@ def _auth_header() -> str:
     return f"Authorization: Basic {cred}"
 
 
-def _ssh_env() -> dict:
-    """GIT_SSH_COMMAND pour le SSH : toujours `StrictHostKeyChecking=accept-new`
-    + UserKnownHostsFile=/dev/null (jamais de blocage sur la clé d'hôte dans le
-    conteneur) ; `-i <keyfile>` si une clé privée est fournie via le secret
-    `gitlab_ssh_key` (écrite 0600, jamais dans une URL loggée)."""
-    opts = ["-o", "StrictHostKeyChecking=accept-new",
-            "-o", f"UserKnownHostsFile={os.devnull}"]
-    key = _env("gitlab_ssh_key", "GITLAB_SSH_KEY")
-    if key:
-        keyfile = os.path.join(tempfile.gettempdir(), "pipeline-git-ssh-key")
-        if not os.path.exists(keyfile):
-            with open(keyfile, "w", encoding="utf-8") as fh:
-                fh.write(key if key.endswith("\n") else key + "\n")
-            os.chmod(keyfile, 0o600)
-        opts = ["-i", keyfile, *opts]
-    return {"GIT_SSH_COMMAND": "ssh " + " ".join(opts)}
-
-
 def _auth_env() -> dict:
     """Env git transient pour clone/fetch/push : GIT_TERMINAL_PROMPT=0 (jamais
-    de prompt dans le conteneur), GIT_SSH_COMMAND (accept-new + clé du secret
-    gitlab_ssh_key si présente) et http.extraHeader Basic PAT pour les URL https."""
-    env = {"GIT_TERMINAL_PROMPT": "0", **_ssh_env()}
+    de prompt interactif dans le conteneur) et http.extraHeader Basic PAT
+    si `gitlab_token` est présent (jamais de credential dans une URL)."""
+    env = {"GIT_TERMINAL_PROMPT": "0"}
     if git_token():
         env.update({
             "GIT_CONFIG_COUNT": "1",
@@ -99,6 +80,20 @@ def _auth_env() -> dict:
 
 def is_url(repo: str) -> bool:
     return bool(re.match(r"^(?:https?|ssh)://|^[^@/\s]+@[^:/\s]+:", repo))
+
+
+def normalize_repo_url(repo: str) -> str:
+    """Convertit une URL git SSH en HTTPS pour les opérations git (le worker
+    s'authentifie par PAT, pas par clé SSH) :
+    `git@host:group/projet.git` / `ssh://git@host[:port]/group/projet.git`
+    -> `https://host/group/projet.git`. Les http(s) passent telles quelles."""
+    if repo.startswith(("http://", "https://")):
+        return repo
+    m = re.match(r"^(?:ssh://)?[^@/\s]+@([^:/\s]+)(?::\d+)?[/:](.+)$", repo)
+    if m:
+        host, path = m.group(1), m.group(2)
+        return f"https://{host}/{path}"
+    return repo
 
 
 def _parse_repo_url(repo: str) -> tuple[str, str]:
@@ -135,6 +130,7 @@ async def ensure_workspace(repo: str) -> dict:
     chemin. Si c'est un chemin local, le retourne tel quel (mode local)."""
     if not is_url(repo):
         return {"path": repo, "url": None}
+    repo = normalize_repo_url(repo)   # git@... -> https://... (auth PAT, pas SSH)
     name = repo.rstrip("/").split("/")[-1].removesuffix(".git")
     digest = hashlib.md5(repo.encode()).hexdigest()[:8]
     root = _env("pipeline_workspace", "PIPELINE_WORKSPACE") \
@@ -150,32 +146,23 @@ async def ensure_workspace(repo: str) -> dict:
         if res["code"] != 0:
             out = res["output"]
             hints = []
-            if "Host key verification failed" in out:
-                hints.append("clé d'hôte SSH refusée — inattendu (accept-new), "
-                             "vérifier GIT_SSH_COMMAND dans le worker")
-            if "Permission denied (publickey)" in out:
-                hints.append("auth SSH refusée : secret gitlab_ssh_key absent/non bindé "
-                             "OU clé publique pas enregistrée comme deploy key sur le projet "
-                             "(re-run python scripts/deploy.py pour binder le secret)")
-            if "could not read Username" in out or "Authentication failed" in out:
-                hints.append("gitlab_token absent du worker ou PAT invalide — vérifier le "
-                             "binding du secret (re-run python scripts/deploy.py), scopes "
-                             "read_repository/write_repository/api")
-            if not git_token() and not _env("gitlab_ssh_key", "GITLAB_SSH_KEY"):
-                hints.append("AUCUN credential dans le worker (ni gitlab_ssh_key ni "
-                             "gitlab_token) : re-run python scripts/deploy.py après avoir "
-                             "créé les secrets dans Studio > Secrets Manager")
+            if "Host key verification failed" in out or "publickey" in out:
+                hints.append("auth SSH inattendue (les URL git@ sont normalisées en HTTPS)")
+            if "could not read Username" in out or "Authentication failed" in out \
+                    or "HTTP Basic: Access denied" in out:
+                hints.append("gitlab_token absent du worker ou PAT refusé — vérifier le "
+                             "binding du secret (re-run python scripts/deploy.py) et les "
+                             "scopes read_repository/write_repository/api du PAT")
+            if not git_token():
+                hints.append("gitlab_token ABSENT du worker : re-run python scripts/deploy.py "
+                             "après avoir créé le secret gitlab_token dans Studio > Secrets Manager")
             raise RuntimeError(f"clone failed: {out}{' — ' + ' | '.join(hints) if hints else ''}")
         await _sh(["git", "checkout", "-f", await base_branch(dest)], dest)
-    # Les credentials persistent dans .git/config du workspace (jamais dans le
-    # remote URL) : Basic PAT pour https, core.sshCommand pour le SSH.
+    # Le credential persiste dans .git/config du workspace (jamais dans le
+    # remote URL) : Basic PAT pour le git over HTTPS.
     if git_token():
         await _sh(["git", "config", "http.extraHeader", _auth_header()], dest)
-    ssh_cmd = _ssh_env().get("GIT_SSH_COMMAND")
-    if ssh_cmd:
-        await _sh(["git", "config", "core.sshCommand", ssh_cmd], dest)
-    return {"path": dest, "url": repo, "token_present": bool(git_token()),
-            "ssh_key_present": bool(ssh_cmd)}
+    return {"path": dest, "url": repo, "token_present": bool(git_token())}
 
 
 @workflows.activity()

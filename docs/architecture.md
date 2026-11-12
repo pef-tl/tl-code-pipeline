@@ -137,13 +137,12 @@ Le worker clone alors le repo cible dans `pipeline_workspace` avec
 `release/<change_id>`, ouvre une **Merge Request GitLab** (la gate de review
 finale = la review de la MR), et merge la MR après le signal `approve`.
 
-**Auth forge** : l'URL du repo est utilisée **telle quelle** (pas de
-normalisation). Pour une URL SSH (`git@host:...`), le worker reçoit la clé
-privée via le secret `gitlab_ssh_key` (deploy key GitLab) : écrite dans un
-fichier 0600 au runtime et passée à git via `GIT_SSH_COMMAND` /
-`core.sshCommand` — même fonctionnement qu'une machine de dev. Pour une URL
-HTTPS, le PAT (`gitlab_token`) passe en Basic auth via `http.extraHeader`.
-L'API REST (création/merge de la MR) prend le PAT en `Authorization: Bearer`.
+**Auth forge — 100% PAT, pas de clé SSH** : pour les opérations git
+(clone/push), les URL SSH (`git@host:...`, `ssh://...`) sont converties en
+`https://host/...` (`git_tools.normalize_repo_url`) et le PAT (`gitlab_token`)
+est envoyé en Basic auth via `http.extraHeader` (doc GitLab : tout username non
+vide + PAT en mot de passe). L'API REST (création/merge de la MR) prend le même
+PAT en `Authorization: Bearer` (`_parse_repo_url` accepte https/ssh/scp-like).
 Aucun credential dans une URL loggée ; `GIT_TERMINAL_PROMPT=0` dans le
 conteneur. Scopes du PAT : `read_repository`, `write_repository`, `api`.
 
@@ -214,7 +213,6 @@ en priorité avec fallback sur ce nom — et les autres secrets (`gitlab_token`,
 ### Procédure managée (repo GitHub public `pef-tl/tl-code-pipeline`)
 
 1. Créer les secrets dans **Studio > Secrets Manager** (workspace) :
-   `gitlab_ssh_key` (clé privée SSH du deploy key GitLab),
    `gitlab_token` (PAT, scopes `read_repository` `write_repository` `api`),
    `approval_webhook_url`,
    `gitlab_c8y_repo` (= `git@gitlab.toollive.bearstech.com:toollive-team/toollive-business/toollive-c8y.git`),
