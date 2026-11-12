@@ -72,9 +72,12 @@ def extract_url_token(repo: str) -> tuple[str, str | None]:
 
 def git_token() -> str | None:
     """PAT du pipeline : secret env `gitlab_token` (binding du déploiement),
-    avec fallback sur le PAT embarqué dans l'URL du repo (voir extract_url_token)."""
-    return _env("gitlab_token", "GITLAB_TOKEN", "pipeline_git_token", "PIPELINE_GIT_TOKEN") \
+    avec fallback sur le PAT embarqué dans l'URL du repo (voir extract_url_token).
+    Le token est nettoyé (strip) : un secret copié depuis un terminal peut
+    embarquer un saut de ligne final, ce qui invaliderait le credential Basic."""
+    token = _env("gitlab_token", "GITLAB_TOKEN", "pipeline_git_token", "PIPELINE_GIT_TOKEN") \
         or _URL_TOKEN
+    return token.strip() if token else token
 
 
 def _auth_header() -> str:
@@ -97,6 +100,17 @@ def _auth_env() -> dict:
             "GIT_CONFIG_VALUE_0": _auth_header(),
         })
     return env
+
+
+def _auth_args() -> list[str]:
+    """`-c http.extraHeader=...` à passer à chaque invocation git réseau
+    (clone/fetch/push) : fiable quelle que soit la version de git embarquée
+    dans l'image (la config par env GIT_CONFIG_KEY_n n'est honorée que depuis
+    git 2.31 — sur une image plus ancienne elle est ignorée et le clone
+    part sans credential)."""
+    if not git_token():
+        return []
+    return ["-c", f"http.extraHeader={_auth_header()}"]
 
 
 def is_url(repo: str) -> bool:
@@ -162,12 +176,12 @@ async def ensure_workspace(repo: str) -> dict:
         or os.path.join(tempfile.gettempdir(), "pipeline-workspaces")
     dest = os.path.join(root, f"{name}-{digest}")
     if os.path.isdir(os.path.join(dest, ".git")):
-        await _sh(["git", "fetch", "origin"], dest, extra_env=_auth_env())
+        await _sh(["git", *_auth_args(), "fetch", "origin"], dest, extra_env=_auth_env())
         await _sh(["git", "checkout", "-f", await base_branch(dest)], dest)
         await _sh(["git", "reset", "--hard", "origin/" + await base_branch(dest)], dest)
     else:
         os.makedirs(root, exist_ok=True)
-        res = await _sh(["git", "clone", repo, dest], root, extra_env=_auth_env())
+        res = await _sh(["git", *_auth_args(), "clone", repo, dest], root, extra_env=_auth_env())
         if res["code"] != 0:
             out = res["output"]
             hints = []
@@ -229,7 +243,7 @@ async def create_branch(repo: str, branch: str) -> dict:
 async def push_branch(repo: str, branch: str) -> dict:
     """Push la branche courante du repo vers origin (auth via .git/config
     et/ou env transient _auth_env)."""
-    res = await _sh(["git", "push", "-u", "origin", f"HEAD:refs/heads/{branch}"],
+    res = await _sh(["git", *_auth_args(), "push", "-u", "origin", f"HEAD:refs/heads/{branch}"],
                     repo, extra_env=_auth_env())
     if res["code"] != 0:
         raise RuntimeError(f"push {branch} failed: {res['output']}")
