@@ -65,28 +65,29 @@ def _auth_header() -> str:
     return f"Authorization: Basic {cred}"
 
 
-def _ssh_key_env() -> dict:
-    """GIT_SSH_COMMAND si une clé privée SSH est fournie via le secret
-    `gitlab_ssh_key` — clone/push en `git@...` comme sur une machine de dev.
-    La clé est écrite dans un fichier 0600 (jamais dans une URL loggée)."""
+def _ssh_env() -> dict:
+    """GIT_SSH_COMMAND pour le SSH : toujours `StrictHostKeyChecking=accept-new`
+    + UserKnownHostsFile=/dev/null (jamais de blocage sur la clé d'hôte dans le
+    conteneur) ; `-i <keyfile>` si une clé privée est fournie via le secret
+    `gitlab_ssh_key` (écrite 0600, jamais dans une URL loggée)."""
+    opts = ["-o", "StrictHostKeyChecking=accept-new",
+            "-o", f"UserKnownHostsFile={os.devnull}"]
     key = _env("gitlab_ssh_key", "GITLAB_SSH_KEY")
-    if not key:
-        return {}
-    keyfile = os.path.join(tempfile.gettempdir(), "pipeline-git-ssh-key")
-    if not os.path.exists(keyfile):
-        with open(keyfile, "w", encoding="utf-8") as fh:
-            fh.write(key if key.endswith("\n") else key + "\n")
-        os.chmod(keyfile, 0o600)
-    return {"GIT_SSH_COMMAND": (
-        f"ssh -i {keyfile} -o StrictHostKeyChecking=accept-new "
-        f"-o UserKnownHostsFile={os.devnull}")}
+    if key:
+        keyfile = os.path.join(tempfile.gettempdir(), "pipeline-git-ssh-key")
+        if not os.path.exists(keyfile):
+            with open(keyfile, "w", encoding="utf-8") as fh:
+                fh.write(key if key.endswith("\n") else key + "\n")
+            os.chmod(keyfile, 0o600)
+        opts = ["-i", keyfile, *opts]
+    return {"GIT_SSH_COMMAND": "ssh " + " ".join(opts)}
 
 
 def _auth_env() -> dict:
     """Env git transient pour clone/fetch/push : GIT_TERMINAL_PROMPT=0 (jamais
-    de prompt dans le conteneur), GIT_SSH_COMMAND (clé du secret gitlab_ssh_key)
-    et http.extraHeader Basic PAT pour les URL https."""
-    env = {"GIT_TERMINAL_PROMPT": "0", **_ssh_key_env()}
+    de prompt dans le conteneur), GIT_SSH_COMMAND (accept-new + clé du secret
+    gitlab_ssh_key si présente) et http.extraHeader Basic PAT pour les URL https."""
+    env = {"GIT_TERMINAL_PROMPT": "0", **_ssh_env()}
     if git_token():
         env.update({
             "GIT_CONFIG_COUNT": "1",
@@ -147,16 +148,30 @@ async def ensure_workspace(repo: str) -> dict:
         os.makedirs(root, exist_ok=True)
         res = await _sh(["git", "clone", repo, dest], root, extra_env=_auth_env())
         if res["code"] != 0:
-            hint = ("" if git_token() else
-                    " — gitlab_token ABSENT du worker : vérifier le binding du secret "
-                    "dans le déploiement (re-run python scripts/deploy.py)")
-            raise RuntimeError(f"clone failed: {res['output']}{hint}")
+            out = res["output"]
+            hints = []
+            if "Host key verification failed" in out:
+                hints.append("clé d'hôte SSH refusée — inattendu (accept-new), "
+                             "vérifier GIT_SSH_COMMAND dans le worker")
+            if "Permission denied (publickey)" in out:
+                hints.append("auth SSH refusée : secret gitlab_ssh_key absent/non bindé "
+                             "OU clé publique pas enregistrée comme deploy key sur le projet "
+                             "(re-run python scripts/deploy.py pour binder le secret)")
+            if "could not read Username" in out or "Authentication failed" in out:
+                hints.append("gitlab_token absent du worker ou PAT invalide — vérifier le "
+                             "binding du secret (re-run python scripts/deploy.py), scopes "
+                             "read_repository/write_repository/api")
+            if not git_token() and not _env("gitlab_ssh_key", "GITLAB_SSH_KEY"):
+                hints.append("AUCUN credential dans le worker (ni gitlab_ssh_key ni "
+                             "gitlab_token) : re-run python scripts/deploy.py après avoir "
+                             "créé les secrets dans Studio > Secrets Manager")
+            raise RuntimeError(f"clone failed: {out}{' — ' + ' | '.join(hints) if hints else ''}")
         await _sh(["git", "checkout", "-f", await base_branch(dest)], dest)
     # Les credentials persistent dans .git/config du workspace (jamais dans le
     # remote URL) : Basic PAT pour https, core.sshCommand pour le SSH.
     if git_token():
         await _sh(["git", "config", "http.extraHeader", _auth_header()], dest)
-    ssh_cmd = _ssh_key_env().get("GIT_SSH_COMMAND")
+    ssh_cmd = _ssh_env().get("GIT_SSH_COMMAND")
     if ssh_cmd:
         await _sh(["git", "config", "core.sshCommand", ssh_cmd], dest)
     return {"path": dest, "url": repo, "token_present": bool(git_token()),
