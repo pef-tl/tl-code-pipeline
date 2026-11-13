@@ -14,6 +14,7 @@ workflow.wait_condition — aucun coût compute pendant l'attente.
 
 import asyncio
 import json
+import re
 from datetime import timedelta
 
 import mistralai.workflows as workflows
@@ -34,6 +35,29 @@ def _prefixed_line(text: str, prefix: str) -> str | None:
         if line.strip().startswith(prefix):
             return line.strip()[len(prefix):].strip()
     return None
+
+
+def _extract_json(text: str):
+    """Extrait le JSON d'une réponse d'agent : le modèle peut l'encadrer de
+    prose ou de balises markdown ```json ... ```, voire renvoyer une chaîne
+    vide si la boucle atteint MAX_AGENT_TURNS."""
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("réponse de l'agent vide (MAX_AGENT_TURNS atteint ?)")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        return json.loads(text[start:end + 1])
+    raise RuntimeError(f"aucun JSON dans la réponse de l'agent: {text[:300]!r}")
 
 
 @workflows.workflow.define(
@@ -175,7 +199,10 @@ class SpecToTests:
             "spec",
             repo,
         )
-        tasks = json.loads(plan)["tasks"]
+        plan_obj = _extract_json(plan)
+        tasks = plan_obj.get("tasks") if isinstance(plan_obj, dict) else plan_obj
+        if not tasks:
+            raise RuntimeError(f"planner: aucune tâche dans la réponse: {plan[:300]!r}")
         by_id = {t["id"]: t for t in tasks}
 
         # ------------------------------------------------------------------
