@@ -192,17 +192,30 @@ class SpecToTests:
         # ------------------------------------------------------------------
         # 3. AGENT PLANNER — tasks.md -> tâches unitaires avec dépendances
         self.phase = "plan"
-        plan = await agent_runner.run_agent_activity(
-            "planner",
-            f"Change folder: openspec/changes/{change_id}/ — retourne UNIQUEMENT "
-            f"le JSON {{\"tasks\": [{{id, title, capability, files_hint, depends_on, acceptance}}]}}",
-            "spec",
-            repo,
-        )
-        plan_obj = _extract_json(plan)
-        tasks = plan_obj.get("tasks") if isinstance(plan_obj, dict) else plan_obj
+        plan_prompt = (f"Change folder: openspec/changes/{change_id}/ — retourne UNIQUEMENT "
+                       f"le JSON {{\"tasks\": [{{id, title, capability, files_hint, depends_on, acceptance}}]}}")
+        plan = ""
+        tasks = None
+        for attempt in range(2):
+            plan = await agent_runner.run_agent_activity(
+                "planner",
+                plan_prompt if attempt == 0 else (
+                    plan_prompt + "\n\nTa réponse précédente était vide ou sans JSON valide. "
+                    "Réponds MAINTENANT, sans appeler aucun outil, avec UNIQUEMENT l'objet JSON "
+                    "{\"tasks\": [...]} — aucune prose, aucun markdown."),
+                "spec",
+                repo,
+            )
+            try:
+                plan_obj = _extract_json(plan)
+            except RuntimeError:
+                continue
+            tasks = plan_obj.get("tasks") if isinstance(plan_obj, dict) else plan_obj
+            if tasks:
+                break
         if not tasks:
-            raise RuntimeError(f"planner: aucune tâche dans la réponse: {plan[:300]!r}")
+            raise RuntimeError(
+                f"planner: aucune tâche après 2 tentatives (dernière réponse: {plan[:300]!r})")
         by_id = {t["id"]: t for t in tasks}
 
         # ------------------------------------------------------------------

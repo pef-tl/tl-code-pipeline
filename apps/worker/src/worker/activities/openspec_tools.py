@@ -81,7 +81,7 @@ async def archive_change(repo: str, change_id: str) -> dict:
 @workflows.activity()
 async def read_file_activity(repo: str, path: str) -> dict:
     with open(f"{repo}/{path}", encoding="utf-8") as fh:
-        return {"content": fh.read()}
+        return {"content": fh.read()[:20000]}
 
 
 @workflows.activity()
