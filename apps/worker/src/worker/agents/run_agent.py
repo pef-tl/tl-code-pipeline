@@ -42,6 +42,7 @@ async def run_agent(agent: AgentSpec, user_message: str, tool_impls: dict[str, C
         for name, (spec, _) in tool_impls.items()
     ] if tool_impls else None
 
+    last_answer = ""
     for _ in range(MAX_AGENT_TURNS):
         response = client.chat.complete(
             model=agent.model,
@@ -50,9 +51,12 @@ async def run_agent(agent: AgentSpec, user_message: str, tool_impls: dict[str, C
         )
         choice = response.choices[0]
         messages.append(choice.message.model_dump())
+        text = _content_text(choice.message.content)
+        if text:
+            last_answer = text
 
         if not choice.message.tool_calls:
-            return _content_text(choice.message.content)
+            return text
 
         for call in choice.message.tool_calls:
             fn = call.function
@@ -67,4 +71,4 @@ async def run_agent(agent: AgentSpec, user_message: str, tool_impls: dict[str, C
                 "content": json.dumps(result, default=str),
             })
 
-    return ""  # max_turns atteint : escalade gérée par l'appelant
+    return last_answer  # MAX_AGENT_TURNS atteint : meilleure réponse disponible

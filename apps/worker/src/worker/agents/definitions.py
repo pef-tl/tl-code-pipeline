@@ -84,6 +84,8 @@ Rules:
 - Define shared interfaces (types, API signatures) in the FIRST task so
   parallel tasks code against a stable contract.
 - Tasks with no interdependency run in parallel; the rest, sequentially.
+- Work efficiently: read each file at most once and emit the JSON as soon as
+  you have enough context — the agent loop is bounded (20 turns).
 """
 
 # -------------------------------------------------------------------- DEV ---
