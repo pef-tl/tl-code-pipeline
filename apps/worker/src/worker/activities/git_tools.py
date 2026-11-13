@@ -5,16 +5,19 @@ Chaque activité est durable : retry/backoff configurés par le décorateur,
 état préservé en cas de crash du worker.
 
 Auth forge — 100% PAT (`gitlab_token` / `pipeline_git_token`), pas de clé SSH :
-- Opérations git (clone/push) : les URL SSH (`git@host:...`, `ssh://...`) sont
-  converties en HTTPS (`normalize_repo_url`) et le PAT est envoyé en Basic
-  auth via http.extraHeader (doc GitLab : tout username non vide + PAT en mot
-  de passe) — jamais dans une URL loggée.
+- Opérations git (ls-remote/clone/fetch/push) : les URL SSH (`git@host:...`,
+  `ssh://...`) sont converties en HTTPS (`normalize_repo_url`) et le PAT est
+  embarqué dans l'URL passée à la commande git :
+  `https://<username>:<PAT>@host/<ns>/<proj>.git` (username `gitlab_username`,
+  défaut `pefaidherbe`). L'URL authentifiée n'est JAMAIS logguée ni persistée :
+  argument transitoire des commandes réseau uniquement, le remote `origin`
+  gardant l'URL nettoyée, et toute sortie d'erreur est masquée (`_scrub`).
 - API REST GitLab (Merge Requests) : même PAT en `Authorization: Bearer`.
 - Fallback si le secret n'est pas bindé au déploiement : le PAT peut être
   embarqué dans l'URL du repo passée à l'exécution
-  (`https://oauth2:<PAT>@gitlab.../....git`) — il est extrait, jamais loggué,
-  et retiré de l'URL avant le clone (le clone se fait sur l'URL nettoyée +
-  http.extraHeader).
+  (`https://<username>:<PAT>@gitlab.../....git`) — il est extrait
+  (`extract_url_token`), jamais loggué, et retiré de l'URL nettoyée ; il est
+  réinjecté uniquement via `_authed_url` au moment des commandes réseau.
 Dans tous les cas : GIT_TERMINAL_PROMPT=0 (pas de prompt interactif dans le
 conteneur) et hints guidés si un credential manque.
 """
@@ -22,7 +25,6 @@ conteneur) et hints guidés si un credential manque.
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import json
 import os
@@ -63,7 +65,7 @@ _URL_TOKEN: str | None = None  # PAT extrait d'une URL `https://user:pass@...` p
 def extract_url_token(repo: str) -> tuple[str, str | None]:
     """Si l'URL embarque des credentials (`https://user:pass@host/...`), renvoie
     (URL nettoyée, pass). Sinon (repo, None). Le token n'est jamais loggué :
-    on clone l'URL nettoyée avec http.extraHeader."""
+    on clone l'URL nettoyée (le PAT est réinjecté via `_authed_url`)."""
     m = re.match(r"^(https?://)[^@/\s]+:([^@/\s]+)@(.+)$", repo)
     if m:
         return f"{m.group(1)}{m.group(3)}", m.group(2)
@@ -100,37 +102,39 @@ def git_token_source() -> str | None:
     return src
 
 
-def _auth_header() -> str:
-    """Header d'auth git over HTTPS : Basic avec le PAT en mot de passe et
-    `oauth2` comme username (doc GitLab : tout username non vide convient)."""
+def _gitlab_username() -> str:
+    """Username de l'URL authentifiée (`https://<username>:<PAT>@host/...`) :
+    env `gitlab_username`/`GITLAB_USERNAME`, défaut `pefaidherbe` (GitLab
+    accepte tout username non vide avec un PAT)."""
+    return _env("gitlab_username", "GITLAB_USERNAME") or "pefaidherbe"
+
+
+def _authed_url(repo: str) -> str:
+    """URL git avec credentials embarqués (`https://<username>:<PAT>@host/...`).
+
+    Sert UNIQUEMENT d'argument aux commandes git réseau (ls-remote/clone/fetch/
+    push) : jamais logguée, jamais persistée dans .git/config (le remote
+    `origin` garde l'URL nettoyée). Sans PAT, renvoie l'URL telle quelle."""
     token = git_token()
-    cred = base64.b64encode(f"oauth2:{token}".encode()).decode()
-    return f"Authorization: Basic {cred}"
+    m = re.match(r"^(https?://)([^/]+)(/.*)$", repo)
+    if not token or not m:
+        return repo
+    user = urllib.parse.quote(_gitlab_username(), safe="")
+    tok = urllib.parse.quote(token, safe="")
+    return f"{m.group(1)}{user}:{tok}@{m.group(2)}{m.group(3)}"
 
 
-def _auth_env() -> dict:
-    """Env git transient pour clone/fetch/push : GIT_TERMINAL_PROMPT=0 (jamais
-    de prompt interactif dans le conteneur) et http.extraHeader Basic PAT
-    si `gitlab_token` est présent (jamais de credential dans une URL)."""
-    env = {"GIT_TERMINAL_PROMPT": "0"}
-    if git_token():
-        env.update({
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "http.extraHeader",
-            "GIT_CONFIG_VALUE_0": _auth_header(),
-        })
-    return env
+def _scrub(text: str) -> str:
+    """Masque le PAT dans tout texte destiné à une erreur / un log (selon sa
+    version, git peut echoer l'URL d'une commande réseau dans sa sortie)."""
+    token = git_token()
+    return text.replace(token, "****") if token else text
 
 
-def _auth_args() -> list[str]:
-    """`-c http.extraHeader=...` à passer à chaque invocation git réseau
-    (clone/fetch/push) : fiable quelle que soit la version de git embarquée
-    dans l'image (la config par env GIT_CONFIG_KEY_n n'est honorée que depuis
-    git 2.31 — sur une image plus ancienne elle est ignorée et le clone
-    part sans credential)."""
-    if not git_token():
-        return []
-    return ["-c", f"http.extraHeader={_auth_header()}"]
+def _git_env() -> dict:
+    """Env git transient pour les commandes réseau : GIT_TERMINAL_PROMPT=0
+    (jamais de prompt interactif dans le conteneur)."""
+    return {"GIT_TERMINAL_PROMPT": "0"}
 
 
 def is_url(repo: str) -> bool:
@@ -205,16 +209,16 @@ async def _probe_remote_auth(repo: str) -> None:
     échoue vite et précisément si aucun PAT n'est configuré ou si le forge
     refuse le PAT (401), au lieu d'un clone qui échoue plus tard et moins clair.
     La valeur du PAT n'est jamais incluse dans l'erreur."""
-    res = await _sh(["git", *_auth_args(), "ls-remote", repo, "HEAD"],
-                    os.getcwd(), extra_env=_auth_env())
+    res = await _sh(["git", "ls-remote", _authed_url(repo), "HEAD"],
+                    os.getcwd(), extra_env=_git_env())
     if res["code"] == 0:
         return
-    out = res["output"]
+    out = _scrub(res["output"])
     if not git_token():
         raise RuntimeError(
             f"auth git vers {repo} impossible : aucun PAT configuré — binder le secret "
             f"`gitlab_token` au déploiement (env `gitlab_token`/`GITLAB_TOKEN`) ou passer "
-            f"le PAT dans l'URL du repo (https://oauth2:<PAT>@host/...git) : {out}")
+            f"le PAT dans l'URL du repo (https://<username>:<PAT>@host/...git) : {out}")
     verdict = await _forge_pat_verdict(repo)
     raise RuntimeError(
         f"PAT refusé par le forge pour {repo} (lu depuis la variable "
@@ -241,14 +245,15 @@ async def ensure_workspace(repo: str) -> dict:
         or os.path.join(tempfile.gettempdir(), "pipeline-workspaces")
     dest = os.path.join(root, f"{name}-{digest}")
     if os.path.isdir(os.path.join(dest, ".git")):
-        await _sh(["git", *_auth_args(), "fetch", "origin"], dest, extra_env=_auth_env())
+        await _sh(["git", "fetch", _authed_url(repo), "+refs/heads/*:refs/remotes/origin/*"],
+                dest, extra_env=_git_env())
         await _sh(["git", "checkout", "-f", await base_branch(dest)], dest)
         await _sh(["git", "reset", "--hard", "origin/" + await base_branch(dest)], dest)
     else:
         os.makedirs(root, exist_ok=True)
-        res = await _sh(["git", *_auth_args(), "clone", repo, dest], root, extra_env=_auth_env())
+        res = await _sh(["git", "clone", _authed_url(repo), dest], root, extra_env=_git_env())
         if res["code"] != 0:
-            out = res["output"]
+            out = _scrub(res["output"])
             hints = []
             if "Host key verification failed" in out or "publickey" in out:
                 hints.append("auth SSH inattendue (les URL git@ sont normalisées en HTTPS)")
@@ -265,13 +270,10 @@ async def ensure_workspace(repo: str) -> dict:
                                  "`gitlab_token`/`GITLAB_TOKEN`/`pipeline_git_token` non "
                                  "renseignées) — binder le secret `gitlab_token` au "
                                  "déploiement, ou passer le PAT dans l'URL du repo : "
-                                 "--repo https://oauth2:<PAT>@gitlab.toollive.bearstech.com/.../....git")
+                                 "--repo https://<username>:<PAT>@gitlab.toollive.bearstech.com/.../....git")
             raise RuntimeError(f"clone failed: {out}{' — ' + ' | '.join(hints) if hints else ''}")
+        await _sh(["git", "remote", "set-url", "origin", repo], dest)
         await _sh(["git", "checkout", "-f", await base_branch(dest)], dest)
-    # Le credential persiste dans .git/config du workspace (jamais dans le
-    # remote URL) : Basic PAT pour le git over HTTPS.
-    if git_token():
-        await _sh(["git", "config", "http.extraHeader", _auth_header()], dest)
     return {"path": dest, "url": repo, "token_present": bool(git_token())}
 
 
@@ -311,12 +313,14 @@ async def create_branch(repo: str, branch: str) -> dict:
 
 @workflows.activity()
 async def push_branch(repo: str, branch: str) -> dict:
-    """Push la branche courante du repo vers origin (auth via .git/config
-    et/ou env transient _auth_env)."""
-    res = await _sh(["git", *_auth_args(), "push", "-u", "origin", f"HEAD:refs/heads/{branch}"],
-                    repo, extra_env=_auth_env())
+    """Push la branche courante vers le forge : URL authentifiée
+    `https://<username>:<PAT>@host/...` passée en argument (jamais persistée
+    ni logguée — le remote `origin` reste l'URL nettoyée)."""
+    url = (await _sh(["git", "config", "remote.origin.url"], repo))["output"].strip()
+    res = await _sh(["git", "push", _authed_url(url), f"HEAD:refs/heads/{branch}"],
+                    repo, extra_env=_git_env())
     if res["code"] != 0:
-        raise RuntimeError(f"push {branch} failed: {res['output']}")
+        raise RuntimeError(f"push {branch} failed: {_scrub(res['output'])}")
     return res
 
 
