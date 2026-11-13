@@ -19,7 +19,7 @@ from datetime import timedelta
 import mistralai.workflows as workflows
 from mistralai.workflows import workflow as wf
 
-from worker.agents.definitions import MAX_DEV_ITERATIONS
+from worker.agents.definitions import MAX_DEV_ITERATIONS, MAX_SPEC_ROUNDS
 
 with wf.unsafe.imports_passed_through():
     from worker.activities import agent_runner, git_tools, test_runner
@@ -106,16 +106,16 @@ class SpecToTests:
         #    avec la réponse. Verdict final : ligne "CHANGE_ID: <id>".
         #    Le transcript est interrogeable à tout moment (query `state`).
         self.phase = "spec"
-        spec = defs.spec_agent(tools=build_spec_tools(repo))
         self.conversation.append({"role": "human", "text": request})
         change_id = ""
         round_no = 0
         while not change_id:
-            if round_no >= defs.MAX_SPEC_ROUNDS:
+            if round_no >= MAX_SPEC_ROUNDS:
                 raise RuntimeError(
-                    f"interview spec non convergé après {defs.MAX_SPEC_ROUNDS} "
+                    f"interview spec non convergé après {MAX_SPEC_ROUNDS} "
                     f"tours — escalade humaine (query `state`, signal `reject`)")
-            out = await run_agent(spec, self._transcript(), build_spec_tools(repo))
+            out = await agent_runner.run_agent_activity(
+                "spec", self._transcript(), "spec", repo)
             question = _prefixed_line(out, "QUESTION:")
             cid = _prefixed_line(out, "CHANGE_ID:")
             if question and not cid:
@@ -168,9 +168,8 @@ class SpecToTests:
         # ------------------------------------------------------------------
         # 3. AGENT PLANNER — tasks.md -> tâches unitaires avec dépendances
         self.phase = "plan"
-        planner = defs.planner_agent(tools=[build_spec_tools(repo)["openspec_read"]])
-        plan = await run_agent(
-            planner,
+        plan = await agent_runner.run_agent_activity(
+            "planner",
             f"Change folder: openspec/changes/{change_id}/ — retourne UNIQUEMENT "
             f"le JSON {{\"tasks\": [{{id, title, capability, files_hint, depends_on, acceptance}}]}}",
             "spec",
