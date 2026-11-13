@@ -71,4 +71,16 @@ async def run_agent(agent: AgentSpec, user_message: str, tool_impls: dict[str, C
                 "content": json.dumps(result, default=str),
             })
 
-    return last_answer  # MAX_AGENT_TURNS atteint : meilleure réponse disponible
+    # MAX_AGENT_TURNS atteint : un dernier appel SANS tools force le modèle à
+    # répondre en texte avec ce qu'il a déjà lu (la boucle reste bornée).
+    response = client.chat.complete(
+        model=agent.model,
+        messages=messages + [{
+            "role": "user",
+            "content": ("You have reached the maximum number of tool calls. "
+                        "Do not call any tool: answer NOW with your final "
+                        "answer only, based on what you have already read."),
+        }],
+        tools=None,
+    )
+    return _content_text(response.choices[0].message.content) or last_answer
