@@ -16,6 +16,19 @@ from mistralai.client import Mistral
 from worker.agents.definitions import AgentSpec, MAX_AGENT_TURNS
 
 
+def _content_text(content: Any) -> str:
+    """Contenu d'un message Mistral en texte brut : `str` ou liste de blocs
+    (`thinking`, `text`, ...). Seuls les blocs `text` sont gardés."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            block.get("text", "") for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return str(content) if content is not None else ""
+
+
 async def run_agent(agent: AgentSpec, user_message: str, tool_impls: dict[str, Callable]) -> str:
     """Exécute la boucle modèle -> tools -> modèle jusqu'à la réponse finale."""
     client = Mistral()  # lit MISTRAL_API_KEY
@@ -39,7 +52,7 @@ async def run_agent(agent: AgentSpec, user_message: str, tool_impls: dict[str, C
         messages.append(choice.message.model_dump())
 
         if not choice.message.tool_calls:
-            return choice.message.content or ""
+            return _content_text(choice.message.content)
 
         for call in choice.message.tool_calls:
             fn = call.function
