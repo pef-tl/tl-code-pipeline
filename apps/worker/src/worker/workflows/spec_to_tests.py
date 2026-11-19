@@ -38,6 +38,7 @@ from worker.agents.definitions import (
 with wf.unsafe.imports_passed_through():
     from worker.activities import agent_runner, git_tools, jira_tools, test_runner
     from worker.activities.jira_tools import atlassian_connector
+    from worker.activities.qa_report import format_qa_report
 
 GATE_TIMEOUT = timedelta(hours=24)
 
@@ -424,10 +425,20 @@ class SpecToTests:
             rev = await jira_tools.jira_transition_review(jira_key)
             rev_note = (f" Statut passé à « {rev.get('to') or rev.get('transition')} »."
                         if rev.get("ok") else "")
-            await jira_tools.jira_comment(
-                jira_key,
-                f"📦 MR ouverte pour review : {review_link} (branche `{push_target}`, "
-                f"change_id `{change_id}`){rev_note}")
+            # Lire SPEC.md pour le rapport QA
+            spec_result = await git_tools.read_spec(repo)
+            spec_content = spec_result.get("content", "") if spec_result.get("ok") else ""
+            # Formater le rapport QA
+            qa_report = format_qa_report(
+                spec_content=spec_content,
+                review_link=review_link,
+                diff_output=diff.get("diff", ""),
+                test_results=final,
+            )
+            # Ajouter la note de statut si présente
+            if rev_note:
+                qa_report += f"\n\n{rev_note}"
+            await jira_tools.jira_comment(jira_key, qa_report)
 
         # ------------------------------------------------------------------
         # 6. GATE REVIEW — un signal `reply` = retour de review : le pipeline

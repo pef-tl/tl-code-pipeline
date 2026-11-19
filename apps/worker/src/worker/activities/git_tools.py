@@ -366,6 +366,20 @@ async def diff_against_base(worktree: str) -> dict:
 
 
 @workflows.activity()
+async def read_spec(repo: str) -> dict:
+    """Lit le fichier SPEC.md à la racine du repo/worktree."""
+    spec_path = os.path.join(repo, "SPEC.md")
+    try:
+        with open(spec_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return {"ok": True, "content": content, "path": spec_path}
+    except FileNotFoundError:
+        return {"ok": False, "error": f"SPEC.md introuvable dans {repo}"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@workflows.activity()
 async def cleanup_worktree(repo: str, worktree: str, branch: str) -> dict:
     await _sh(["git", "worktree", "remove", "--force", worktree], repo)
     return await _sh(["git", "branch", "-D", branch], repo)
