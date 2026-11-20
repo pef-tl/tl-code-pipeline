@@ -36,6 +36,8 @@ import urllib.request
 
 import mistralai.workflows as workflows
 
+from worker.activities.scope_guard import PIPELINE_FILES
+
 
 async def _sh(cmd: list[str], cwd: str, extra_env: dict | None = None) -> dict:
     """Exécute une commande shell, renvoie un résultat JSON-sérialisable."""
@@ -318,7 +320,15 @@ async def create_worktree(repo: str, task_id: str) -> dict:
 
 @workflows.activity()
 async def commit_all(worktree: str, message: str) -> dict:
-    res = await _sh(["bash", "-lc", "git add -A && git commit -m \"$1\"", "_", message], worktree)
+    """Commit de tout le worktree SAUF les fichiers du pipeline (SPEC.md) : ils
+    restent locaux et ne doivent jamais partir dans le repo cible (constat
+    TOOLLIVE-3601 / MR !1590 : SPEC.md committé au tour de review)."""
+    excludes = " ".join(f"':(exclude){name}'" for name in PIPELINE_FILES)
+    script = ("git add -A -- . " + excludes
+              + " && for f in " + " ".join(PIPELINE_FILES)
+              + "; do git rm -q --cached --ignore-unmatch \"$f\"; done"
+              + " && git commit -m \"$1\"")
+    res = await _sh(["bash", "-lc", script, "_", message], worktree)
     return res
 
 
@@ -330,6 +340,22 @@ async def merge_branch(repo: str, branch: str) -> dict:
         await _sh(["git", "merge", "--abort"], repo)
         raise RuntimeError(f"merge conflict on {branch}: {res['output']}")
     return res
+
+
+@workflows.activity()
+async def remote_branch_exists(repo: str, branch: str) -> dict:
+    """La branche existe-t-elle déjà sur le remote `origin` ? (constat TOOLLIVE-3607 :
+    relance sur un ticket déjà traité -> même change_id -> push non fast-forward)."""
+    # `origin` est l'URL NETTOYÉE (sans PAT) : sur un GitLab privé, ls-remote
+    # échoue sans authentification -> même URL authentifiée que push_branch.
+    url = (await _sh(["git", "config", "remote.origin.url"], repo))["output"].strip()
+    res = await _sh(["git", "ls-remote", "--heads", _authed_url(url), branch],
+                    repo, extra_env=_git_env())
+    if res["code"] != 0:
+        # Dans le doute (réseau, droits), on considère qu'elle existe : un nom
+        # unique ne coûte rien, un push refusé coûte toute l'exécution.
+        return {"exists": True, "error": _scrub(res["output"])[:300]}
+    return {"exists": bool(res["output"].strip())}
 
 
 @workflows.activity()
@@ -361,8 +387,30 @@ async def push_branch(repo: str, branch: str) -> dict:
 async def diff_against_base(worktree: str) -> dict:
     """Diff de la branche courante contre la branche de base détectée."""
     base = await base_branch(worktree)
-    res = await _sh(["git", "diff", f"{base}...HEAD"], worktree)
+    # Les fusions séquentielles se font sur la branche locale `base` elle-même
+    # (le workspace est en checkout de develop) : `develop...HEAD` est alors VIDE.
+    # On compare donc à la branche distante `origin/<base>` quand elle existe
+    # (constat TOOLLIVE-3604 / MR !1592 : rapport QA « Aucun fichier modifié »).
+    ref = base
+    remote = await _sh(["git", "rev-parse", "--verify", "--quiet", f"origin/{base}"], worktree)
+    if remote["code"] == 0:
+        ref = f"origin/{base}"
+    res = await _sh(["git", "diff", f"{ref}...HEAD"], worktree)
     return {"diff": res["output"], "base": base}
+
+
+@workflows.activity()
+async def read_spec(repo: str) -> dict:
+    """Lit le fichier SPEC.md à la racine du repo/worktree."""
+    spec_path = os.path.join(repo, "SPEC.md")
+    try:
+        with open(spec_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return {"ok": True, "content": content, "path": spec_path}
+    except FileNotFoundError:
+        return {"ok": False, "error": f"SPEC.md introuvable dans {repo}"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 @workflows.activity()

@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.parse
 from typing import Any
 
@@ -474,3 +475,78 @@ async def jira_transition_done(issue_key: str,
     vide = aucune transition, le merge reste manuel)."""
     name = _env("jira_transition_done", "JIRA_TRANSITION_DONE") or ""
     return await _transition(jira, issue_key, name)
+
+
+# ---------------------------------------------------------------- Confluence ---
+# Base de connaissances (ticket « Intégration de JIRA » : utiliser Confluence en
+# amont pour planifier, en aval pour compléter la doc). LECTURE SEULE ici : le
+# pipeline n'écrit jamais dans Confluence ; il cite les pages liées au ticket
+# (contexte pour l'agent spec, et « doc à vérifier » dans le rapport QA).
+
+def confluence_query(summary: str) -> str:
+    """Texte de recherche à partir du titre du ticket : sans préfixe [..], sans
+    guillemets (injection CQL), 100 caractères max."""
+    text = re.sub(r"\[[^\]]*\]", " ", summary or "")
+    text = re.sub(r"[\"'«»“”\\]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:100]
+
+
+def _confluence_pages(result: Any, limit: int) -> list[dict]:
+    """Pages {title, url, excerpt} trouvées dans une réponse de recherche, quel
+    que soit son format (v1 `results[].content`, v2 `results[]`, liste brute)."""
+    pages: list[dict] = []
+    base = ""
+    if isinstance(result, dict):
+        base = ((result.get("_links") or {}).get("base") or "").rstrip("/")
+        items = result.get("results") or result.get("pages") or result.get("items") or []
+    elif isinstance(result, list):
+        items = result
+    else:
+        items = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content") if isinstance(item.get("content"), dict) else item
+        title = content.get("title") or item.get("title")
+        if not title:
+            continue
+        links = content.get("_links") or item.get("_links") or {}
+        url = (item.get("url") or content.get("url") or item.get("webUrl")
+               or links.get("webui") or "")
+        if url.startswith("/"):
+            url = f"{base}{url}" if base else url
+        excerpt = re.sub(r"@@@(end)?hl@@@", "", str(item.get("excerpt") or ""))
+        pages.append({"title": str(title).strip(), "url": url,
+                      "excerpt": re.sub(r"\s+", " ", excerpt).strip()[:200]})
+        if len(pages) >= limit:
+            break
+    return pages
+
+
+async def _confluence_search(jira: ToolCallClient, summary: str, limit: int) -> dict:
+    query = confluence_query(summary)
+    if not query:
+        return {"ok": False, "error": "titre vide", "pages": []}
+    # Serveur MCP v2 (mcp.atlassian.com/v2) : `searchConfluence` exige `cql`
+    # (constat exécution 65fe3c32 : « Invalid arguments for tool searchConfluence:
+    # Required at cql ») ; v1 : `searchConfluenceUsingCql`, mêmes arguments.
+    cql = f'type = page AND text ~ "{query}"'
+    attempts = [
+        ("searchConfluence", {"cloudId": cloud_id(), "cql": cql, "limit": limit}),
+        ("searchConfluenceUsingCql", {"cloudId": cloud_id(), "cql": cql, "limit": limit}),
+    ]
+    last: BaseException | None = None
+    for tool, args in attempts:
+        try:
+            return {"ok": True, "pages": _confluence_pages(await _call(jira, tool, **args), limit)}
+        except Exception as exc:  # outil absent, scopes, réseau : on tente le suivant
+            last = exc
+    return {"ok": False, "error": _exc_text(last)[:300] if last else "", "pages": []}
+
+
+@workflows.activity()
+async def confluence_search(summary: str, limit: int = 3,
+                            jira: ToolCallClient = Depends(atlassian_connector)) -> dict:
+    """Pages Confluence liées au titre du ticket. NON bloquant : en cas d'erreur,
+    {"ok": False, "pages": []} et le pipeline continue."""
+    return await _confluence_search(jira, summary, limit)
