@@ -50,11 +50,17 @@ WORKFLOW_EXECUTION_TIMEOUT = timedelta(hours=6)
 
 
 def _prefixed_line(text: str, prefix: str) -> str | None:
-    """Extrait le contenu de la première ligne commençant par `prefix`."""
-    for line in text.splitlines():
-        if line.strip().startswith(prefix):
-            return line.strip()[len(prefix):].strip()
-    return None
+    """Extrait le contenu de la première ligne contenant le marqueur `PREFIX:`
+    en début de ligne, tolérant au markdown et à l'espace avant les deux-points
+    (« **QUESTION :** ... », « - QUESTION : ... », « question: ... »)."""
+    m = re.search(
+        rf"(?im)^[ \t]*[*_`>#\-]*[ \t]*{re.escape(prefix.rstrip(':'))}\s*:\s*(.+?)[ \t]*$",
+        text or "",
+    )
+    if not m:
+        return None
+    value = m.group(1).strip()
+    return re.sub(r"^[*_`\s]+|[*_`\s]+$", "", value)
 
 
 def _extract_json(text: str):
@@ -242,8 +248,10 @@ class SpecToTests:
         #    `reply` (scripts/talk.py) et relance l'agent avec la réponse.
         #    L'agent écrit SPEC.md puis termine par "CHANGE_ID: <id>".
         #    Le transcript est interrogeable à tout moment (query `state`).
-        #    Seule garde : MAX_EMPTY_SPEC_ROUNDS tours consécutifs sans aucune
-        #    progression (ni QUESTION ni CHANGE_ID) -> escalade anti boucle vide.
+        #    Seule garde : MAX_EMPTY_SPEC_ROUNDS tours consécutifs sans progression
+        #    (réponse vide ou identique à la précédente) -> escalade anti boucle
+        #    vide. Le retour de chaque activité est TOUJOURS conservé dans le
+        #    transcript (query `state`) et renvoyé à l'agent au tour suivant.
         self.phase = "spec"
         self.conversation.append({"role": "human", "text": request or (
             "[Aucune demande initiale fournie — interview de zéro : définis le besoin, "
@@ -256,32 +264,50 @@ class SpecToTests:
         change_id = ""
         round_no = 0
         empty_rounds = 0
+        last_out = ""
         while not change_id:
             round_no += 1
             out = await agent_runner.run_agent_activity(
                 "spec", self._transcript(), "spec", repo)
+            out = (out or "").strip()
             question = _prefixed_line(out, "QUESTION:")
             cid = _prefixed_line(out, "CHANGE_ID:")
+            if out:
+                # Le retour de l'activité est pris en compte : conservé dans le
+                # transcript (query `state`) et renvoyé à l'agent au tour suivant.
+                self.conversation.append({"role": "agent", "text": out})
             if not question and not cid:
-                empty_rounds += 1
+                # Un tour n'est « vide » que si la réponse est vide ou identique à
+                # la précédente : un contenu même sans marqueur est une progression.
+                if out and out != last_out:
+                    empty_rounds = 0
+                    self.conversation.append({"role": "human", "text": (
+                        "[Ta réponse ne contient ni ligne « QUESTION: » ni ligne "
+                        "« CHANGE_ID: » — termine ta prochaine réponse par exactement "
+                        "une de ces deux lignes.]")})
+                else:
+                    empty_rounds += 1
+                last_out = out
                 if empty_rounds >= MAX_EMPTY_SPEC_ROUNDS:
                     await self._gate(
                         subject="Interview spec sans progression",
                         payload=(f"L'agent spec n'a ni posé de question ni renvoyé de CHANGE_ID "
-                                 f"depuis {MAX_EMPTY_SPEC_ROUNDS} tours (réponses vides) — "
+                                 f"depuis {MAX_EMPTY_SPEC_ROUNDS} tours (réponses vides ou identiques) — "
                                  f"le workflow va échouer (escalade).\n"
+                                 f"Dernière réponse reçue : {last_out[:500]!r}\n"
                                  f"Transcript : python scripts/status.py {execution_id}\n"
                                  f"Arrêter proprement : python scripts/approve.py {execution_id} reject"),
                         execution_id=execution_id, jira_key=jira_key,
                     )
                     raise RuntimeError(
                         f"interview spec sans progression depuis {MAX_EMPTY_SPEC_ROUNDS} "
-                        f"tours (réponses vides) — escalade humaine (query `state`, signal `reject`)")
+                        f"tours (réponses vides ou identiques) — escalade humaine "
+                        f"(query `state`, signal `reject`)")
                 continue
             empty_rounds = 0
+            last_out = ""
             if question and not cid:
                 self.pending_question = question
-                self.conversation.append({"role": "agent", "text": question})
                 await self._gate(
                     subject=f"Question de l'agent spec (tour {round_no})",
                     payload=(f"{question}\n\nRéponds à l'agent : python scripts/talk.py "
@@ -324,7 +350,6 @@ class SpecToTests:
                 continue
             change_id = cid or ""
         self.pending_question = None
-        self.conversation.append({"role": "agent", "text": f"CHANGE_ID: {change_id}"})
 
         # ------------------------------------------------------------------
         # 2. GATE HUMAINE — l'humain relit proposal.md + specs/
