@@ -68,12 +68,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.parse
 from typing import Any
 
 import mistralai.workflows as workflows
 from mistralai.workflows import Depends
 from mistralai.workflows.plugins.mistralai.connectors import ConnectorSlot, ToolCallClient, connector
+
+from worker.activities import jira_workflow
 
 DEFAULT_JIRA_BASE_URL = "https://toollive.atlassian.net/jira"
 # Connecteur workspace `atlassian_94e0` (id 01a1ef49-...), serveur
@@ -367,52 +370,155 @@ async def _search(jira: ToolCallClient, jql: str, max_results: int) -> list:
     return [_brief(i) for i in issues or []]
 
 
-async def _comment(jira: ToolCallClient, issue_key: str, body: str) -> dict:
-    """Poste un commentaire markdown. NON bloquant : en cas d'erreur, retourne
-    {"ok": False, "error": ...} sans faire échouer le pipeline."""
+def _comment_id(result: Any) -> str:
+    """Identifiant du commentaire créé, quelle que soit la forme de la réponse
+    ({"id": ...}, {"comment": {"id": ...}}, texte « Comment 12345 ... »)."""
+    if isinstance(result, dict):
+        if result.get("id") not in (None, ""):
+            return str(result["id"])
+        for key in ("comment", "data", "result"):
+            found = _comment_id(result.get(key))
+            if found:
+                return found
+    if isinstance(result, str):
+        m = re.search(r"comment\D{0,20}?(\d+)", result, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return ""
+
+
+async def _comment(jira: ToolCallClient, issue_key: str, body: str,
+                   comment_id: str = "") -> dict:
+    """Poste un commentaire markdown, ou MODIFIE le commentaire `comment_id`
+    (addOrEditJiraIssueComment : « omit commentId to add, or pass one to edit »).
+    Retourne {"ok": True, "id": <id du commentaire>}. NON bloquant : en cas
+    d'erreur, retourne {"ok": False, "error": ...} sans faire échouer le pipeline."""
     try:
-        await _call(jira, "addCommentToJiraIssue",
-                    cloudId=cloud_id(), issueIdOrKey=issue_key,
-                    commentBody=body, contentFormat="markdown")
-        return {"ok": True}
+        if comment_id:
+            result = _parse_tool_result(await jira.call_tool(
+                tool_name="addOrEditJiraIssueComment",
+                arguments={"cloudId": cloud_id(), "issueIdOrKey": issue_key,
+                           "commentId": comment_id, "commentBody": body,
+                           "contentFormat": "markdown"}))
+            return {"ok": True, "id": _comment_id(result) or comment_id}
+        result = await _call(jira, "addCommentToJiraIssue",
+                             cloudId=cloud_id(), issueIdOrKey=issue_key,
+                             commentBody=body, contentFormat="markdown")
+        return {"ok": True, "id": _comment_id(result)}
     except Exception as exc:
         return {"ok": False, "error": str(exc)[:300]}
+
+
+def _norm_status(name: Any) -> str:
+    """« In Progress », « in-progress », « IN_PROGRESS » -> « inprogress »."""
+    return re.sub(r"[\s_\-]+", "", str(name or "")).lower()
+
+
+def _transition_items(result: Any) -> list:
+    if isinstance(result, dict):
+        for key in ("transitions", "values", "results", "items"):
+            if isinstance(result.get(key), list):
+                return result[key]
+        for key in ("result", "data", "issue"):  # enveloppes executeRead / getJiraIssue
+            if isinstance(result.get(key), (dict, list)):
+                inner = _transition_items(result[key])
+                if inner:
+                    return inner
+        return []
+    if isinstance(result, list) and all(isinstance(t, dict) and "id" in t for t in result):
+        return result
+    return []
+
+
+async def _call_variants(jira: ToolCallClient, tools: tuple[str, ...],
+                         variants: list[dict]) -> tuple[Any, list[str]]:
+    """Essaie chaque (outil, jeu d'arguments) jusqu'au premier succès. Les noms et
+    arguments diffèrent entre le connecteur builtin v1 et le serveur MCP v2
+    (mcp.atlassian.com/v2) : on ne devine pas, on essaie et on GARDE chaque erreur
+    complète (constat TOOLLIVE-3601 à 3611 : « connector tool call failed » sans
+    la raison, statut jamais changé alors que l'étape était verte)."""
+    errors: list[str] = []
+    for tool in tools:
+        for args in variants:
+            try:
+                return _parse_tool_result(await jira.call_tool(tool_name=tool, arguments=args)), errors
+            except Exception as exc:
+                errors.append(f"{tool}({', '.join(sorted(args))}): {_exc_text(exc)[:400]}")
+    raise RuntimeError(" | ".join(errors)[:1500])
+
+
+async def _list_transitions(jira: ToolCallClient, cid: str, issue_key: str) -> list:
+    """Transitions possibles du ticket. Le serveur MCP v2 (connecteur atlassian_49bb)
+    n'expose PAS d'outil direct pour les lister (constat exécution 41167b17 :
+    « Unknown tool: 'listJiraIssueTransitions' » et « 'getTransitionsForJiraIssue' »),
+    alors que transitionJiraIssue demande un transitionId. Trois voies, dans l'ordre :
+    1. outils directs (connecteur builtin v1 / futurs serveurs) ;
+    2. getJiraIssue avec `expand=transitions` (paramètre standard de l'API REST
+       Jira : la réponse contient alors `transitions`) ;
+    3. opération `listJiraIssueTransitions` via l'outil générique `executeRead`
+       du serveur v2 (« execute-family tool for read operations »).
+    Toutes les erreurs sont gardées (dans l'exception finale)."""
+    errors: list[str] = []
+    attempts = [
+        (("listJiraIssueTransitions", "getTransitionsForJiraIssue"),
+         [{"cloudId": cid, "issueIdOrKey": issue_key}, {"cloudId": cid, "issueKey": issue_key}]),
+        (("getJiraIssue",),
+         [{"cloudId": cid, "issueIdOrKey": issue_key, "expand": "transitions", "fields": ["status"]},
+          {"cloudId": cid, "issueIdOrKey": issue_key, "expand": "transitions"}]),
+        (("executeRead",),
+         [{"name": "listJiraIssueTransitions",
+           "inputs": {"cloudId": cid, "issueIdOrKey": issue_key}},
+          {"operation": "listJiraIssueTransitions",
+           "arguments": {"cloudId": cid, "issueIdOrKey": issue_key}},
+          {"name": "listJiraIssueTransitions",
+           "input": {"cloudId": cid, "issueIdOrKey": issue_key}}]),
+    ]
+    for tools, variants in attempts:
+        try:
+            result, _ = await _call_variants(jira, tools, variants)
+        except Exception as exc:
+            errors.append(str(exc))
+            continue
+        items = _transition_items(result)
+        if items:
+            return items
+        errors.append(f"{tools[0]} : réponse sans transitions ({str(result)[:200]})")
+    raise RuntimeError(" || ".join(errors)[:3000])
 
 
 async def _transition(jira: ToolCallClient, issue_key: str, transition_name: str) -> dict:
-    """Transition de statut par NOM (ex. « In Progress », « code-review ») : résout
-    l'id via getTransitionsForJiraIssue (v2 : listJiraIssueTransitions) puis appelle
-    transitionJiraIssue (v1 : transition={"id": ...}, v2 : transitionId=...). Si la
-    transition n'est pas disponible sur le ticket : {"ok": False, "reason": ...}."""
+    """Transition de statut par NOM (ex. « devs-en-cours », « code-review ») :
+    liste les transitions possibles du ticket, choisit celle dont le nom ou le
+    statut d'arrivée correspond (sans tenir compte de la casse, des espaces et
+    des tirets), puis l'applique. Jamais bloquant : {"ok": False, ...} sinon,
+    avec la raison COMPLÈTE (ou la liste des transitions disponibles)."""
     if not transition_name:
         return {"ok": False, "reason": "nom de transition vide"}
+    cid = cloud_id()
     try:
-        transitions = await _call(jira, "getTransitionsForJiraIssue",
-                                  cloudId=cloud_id(), issueIdOrKey=issue_key)
-        items = transitions.get("transitions") if isinstance(transitions, dict) else transitions
-        wanted = transition_name.strip().lower()
-        match = None
-        for t in items or []:
-            names = {str(t.get("name", "")).lower(),
-                     str((t.get("to") or {}).get("name", "")).lower()}
-            if wanted in names:
-                match = t
-                break
-        if not match:
-            return {"ok": False,
-                    "reason": f"transition {transition_name!r} indisponible sur {issue_key}"}
-        try:
-            await _call(jira, "transitionJiraIssue",
-                        cloudId=cloud_id(), issueIdOrKey=issue_key,
-                        transition={"id": match["id"]})
-        except Exception:
-            await _call(jira, "transitionJiraIssue",
-                        cloudId=cloud_id(), issueIdOrKey=issue_key,
-                        transitionId=str(match["id"]))
-        return {"ok": True, "transition": match.get("name"),
-                "to": (match.get("to") or {}).get("name")}
+        items = await _list_transitions(jira, cid, issue_key)
     except Exception as exc:
-        return {"ok": False, "error": str(exc)[:300]}
+        return {"ok": False, "error": f"lecture des transitions : {exc}"[:1500]}
+    wanted = _norm_status(transition_name)
+    match = next((t for t in items if isinstance(t, dict) and wanted in {
+        _norm_status(t.get("name")), _norm_status((t.get("to") or {}).get("name"))}), None)
+    if not match:
+        available = sorted({str((t.get("to") or {}).get("name") or t.get("name"))
+                            for t in items if isinstance(t, dict)})
+        return {"ok": False,
+                "reason": (f"transition {transition_name!r} indisponible sur {issue_key} ; "
+                           f"disponibles : {', '.join(available) or 'aucune'}")}
+    tid = str(match.get("id"))
+    try:
+        await _call_variants(jira, ("transitionJiraIssue",), [
+            {"cloudId": cid, "issueIdOrKey": issue_key, "transitionId": tid},
+            {"cloudId": cid, "issueIdOrKey": issue_key, "transition": {"id": tid}},
+            {"cloudId": cid, "issueKey": issue_key, "transitionId": tid},
+        ])
+    except Exception as exc:
+        return {"ok": False, "error": f"transition {match.get('name')!r} (id {tid}) : {exc}"[:1500]}
+    return {"ok": True, "transition": match.get("name"),
+            "to": (match.get("to") or {}).get("name")}
 
 
 @workflows.activity()
@@ -442,6 +548,61 @@ async def jira_comment(issue_key: str, body: str,
     return await _comment(jira, issue_key, body)
 
 
+async def _find_comment_id(jira: ToolCallClient, issue_key: str, marker: str) -> str:
+    """Retrouve l'id du commentaire « Suivi » sur le ticket (le plus récent qui
+    contient `marker` = identifiant court de l'exécution). Constat TOOLLIVE-3613
+    (exécution f05f4b8e) : la réponse de addOrEditJiraIssueComment ne donnait pas
+    d'id exploitable -> un nouveau commentaire à chaque étape."""
+    if not marker:
+        return ""
+    try:
+        issue = await _call(jira, "getJiraIssue", cloudId=cloud_id(),
+                            issueIdOrKey=issue_key, fields=["comment"],
+                            responseContentFormat="markdown")
+    except Exception:
+        return ""
+    fields = issue.get("fields") or {} if isinstance(issue, dict) else {}
+    comments = ((fields.get("comment") or {}).get("comments")
+                or (issue.get("comments") if isinstance(issue, dict) else None) or [])
+    found = ""
+    for c in comments:
+        if not isinstance(c, dict) or c.get("id") in (None, ""):
+            continue
+        body = c.get("body")
+        text = _adf_to_text(body) if isinstance(body, dict) else str(body or "")
+        if marker in text and "Pipeline sur" in text:
+            found = str(c["id"])  # ordre chronologique : on garde le dernier
+    return found
+
+
+async def _follow_comment(jira: ToolCallClient, issue_key: str, body: str,
+                          comment_id: str = "", marker: str = "") -> dict:
+    if comment_id:
+        out = await _comment(jira, issue_key, body, comment_id)
+        if out.get("ok"):
+            return {**out, "edited": True}
+        edit_error = out.get("error", "")
+    else:
+        edit_error = ""
+    out = await _comment(jira, issue_key, body)
+    if out.get("ok") and not out.get("id"):
+        out["id"] = await _find_comment_id(jira, issue_key, marker)
+    out = {**out, "edited": False}
+    if edit_error:
+        out["edit_error"] = edit_error
+    return out
+
+
+@workflows.activity()
+async def jira_follow(issue_key: str, body: str, comment_id: str = "", marker: str = "",
+                      jira: ToolCallClient = Depends(atlassian_connector)) -> dict:
+    """Commentaire « Suivi » vivant : créé une fois, puis MODIFIÉ à chaque étape
+    (au lieu d'un nouveau commentaire par étape). Si la modification échoue
+    (commentaire supprimé, outil v1 sans édition), en crée un nouveau.
+    Non bloquant. Retourne {"ok", "id", "edited"}."""
+    return await _follow_comment(jira, issue_key, body, comment_id, marker)
+
+
 @workflows.activity()
 async def jira_transition(issue_key: str, transition_name: str,
                           jira: ToolCallClient = Depends(atlassian_connector)) -> dict:
@@ -449,13 +610,18 @@ async def jira_transition(issue_key: str, transition_name: str,
     return await _transition(jira, issue_key, transition_name)
 
 
+def start_transition_name() -> str:
+    return _env("jira_transition_start", "JIRA_TRANSITION_START") or "devs-en-cours"
+
+
 @workflows.activity()
 async def jira_transition_start(issue_key: str,
                                 jira: ToolCallClient = Depends(atlassian_connector)) -> dict:
     """Transition de démarrage du run : env `jira_transition_start` (défaut
-    « In Progress »)."""
-    name = _env("jira_transition_start", "JIRA_TRANSITION_START") or "In Progress"
-    return await _transition(jira, issue_key, name)
+    « devs-en-cours », statut de développement du workflow JIRA Toollive)."""
+    # Workflow JIRA Toollive : « In Progress » n'existe pas (constat 3601-3607),
+    # le statut de développement s'appelle « devs-en-cours ».
+    return await _transition(jira, issue_key, start_transition_name())
 
 
 @workflows.activity()
@@ -474,3 +640,147 @@ async def jira_transition_done(issue_key: str,
     vide = aucune transition, le merge reste manuel)."""
     name = _env("jira_transition_done", "JIRA_TRANSITION_DONE") or ""
     return await _transition(jira, issue_key, name)
+
+
+async def _move(jira: ToolCallClient, issue_key: str, phase: str, by_human: bool = False) -> dict:
+    """Changement de statut GARDÉ (workflow v4, voir jira_workflow.py) :
+    1. statut visé = jira_workflow.status_for(phase) (vide = rien à faire) ;
+    2. statut actuel lu sur le ticket ;
+    3. garde : transition absente du workflow v4 ou réservée à un humain sans
+       décision humaine (`by_human`) -> refus, le ticket ne bouge pas ;
+    4. sinon chaque étape du plus court chemin autorisé est appliquée
+       (ex. Specs -> ready-for-dev -> devs-en-cours après la gate n°1).
+    Jamais bloquant : {"ok": False, "reason"/"error"} en cas de refus ou d'échec."""
+    target = jira_workflow.status_for(phase)
+    if not target:
+        return {"ok": False, "skipped": True, "reason": f"aucun statut configuré pour « {phase} »"}
+    if not jira_workflow.guard_enabled():
+        return await _transition(jira, issue_key, target)
+    try:
+        current = (await _fetch_issue(jira, issue_key)).get("status") or ""
+    except Exception as exc:
+        current = ""
+        unread = _exc_text(exc)[:300]
+    else:
+        unread = ""
+    allowed, why = jira_workflow.check_transition(current, target, by_human)
+    if not allowed:
+        return {"ok": False, "refused": True, "from": current, "to": target,
+                "reason": f"garde workflow v4 : {why}"
+                          + (f" (lecture du statut : {unread})" if unread else "")}
+    if jira_workflow.norm(current) == jira_workflow.norm(target):
+        return {"ok": True, "skipped": True, "from": current, "to": current}
+    if current and jira_workflow.norm(current) != jira_workflow.norm(jira_workflow.BLOCKED):
+        steps = jira_workflow.path_to(current, target, by_human)
+    else:
+        steps = [target]
+    out: dict = {"ok": False, "reason": "aucune étape"}
+    for step in steps:
+        out = await _transition(jira, issue_key, step)
+        if not out.get("ok"):
+            out.update({"from": current, "to": target, "failed_step": step})
+            return out
+    out.update({"from": current, "to": out.get("to") or target})
+    return out
+
+
+@workflows.activity()
+async def jira_move(issue_key: str, phase: str, by_human: bool = False,
+                    jira: ToolCallClient = Depends(atlassian_connector)) -> dict:
+    """Fait passer le ticket au statut de la phase `phase` du pipeline (start,
+    spec, spec_approved, spec_rejected, dev, tests, review, review_fix, done,
+    blocked), sous la garde du workflow v4. `by_human=True` uniquement quand le
+    pipeline exécute une décision humaine explicite (signal approve/reject/reply)."""
+    return await _move(jira, issue_key, phase, by_human)
+
+
+# ---------------------------------------------------------------- Confluence ---
+# Base de connaissances (ticket « Intégration de JIRA » : utiliser Confluence en
+# amont pour planifier, en aval pour compléter la doc). LECTURE SEULE ici : le
+# pipeline n'écrit jamais dans Confluence ; il cite les pages liées au ticket
+# (contexte pour l'agent spec, et « doc à vérifier » dans le rapport QA).
+
+# Mots trop généraux pour chercher une doc (constat exécution 7c326e83 : le
+# titre entier « Faute d'orthographe reopenned dans l'historique des devis
+# (anglais) » ne trouvait aucune page — CQL `text ~` exige tous les mots).
+_STOPWORDS = set("""
+le la les un une des du de d l au aux et ou en dans sur pour par avec sans
+ne pas plus que qui quoi est sont a the an of in on for to with and or is are
+faute fautes orthographe typo bug bogue erreur probleme problème test adlc vrai
+anglais francais français english french espagnol portugais chinois langue
+page affiche affichage texte libelle libellé quand alors when then
+""".split())
+
+
+def confluence_query(summary: str, max_words: int = 3) -> str:
+    """Mots-clés de recherche tirés du titre du ticket : sans préfixe [..], sans
+    guillemets (injection CQL), sans mots vides ni mots trop généraux ; les
+    `max_words` premiers mots significatifs (CQL `text ~` exige tous les mots)."""
+    text = re.sub(r"\[[^\]]*\]", " ", summary or "")
+    text = re.sub(r"[\"'«»“”\\()]", " ", text)
+    words = [w for w in re.findall(r"[\w/-]+", text) if len(w) > 2 and w.lower() not in _STOPWORDS]
+    return " ".join(words[:max_words])[:100]
+
+
+def _confluence_pages(result: Any, limit: int) -> list[dict]:
+    """Pages {title, url, excerpt} trouvées dans une réponse de recherche, quel
+    que soit son format (v1 `results[].content`, v2 `results[]`, liste brute)."""
+    pages: list[dict] = []
+    base = ""
+    if isinstance(result, dict):
+        base = ((result.get("_links") or {}).get("base") or "").rstrip("/")
+        items = result.get("results") or result.get("pages") or result.get("items") or []
+    elif isinstance(result, list):
+        items = result
+    else:
+        items = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content") if isinstance(item.get("content"), dict) else item
+        title = content.get("title") or item.get("title")
+        if not title:
+            continue
+        links = content.get("_links") or item.get("_links") or {}
+        url = (item.get("url") or content.get("url") or item.get("webUrl")
+               or links.get("webui") or "")
+        if url.startswith("/"):
+            url = f"{base}{url}" if base else url
+        excerpt = re.sub(r"@@@(end)?hl@@@", "", str(item.get("excerpt") or ""))
+        pages.append({"title": str(title).strip(), "url": url,
+                      "excerpt": re.sub(r"\s+", " ", excerpt).strip()[:200]})
+        if len(pages) >= limit:
+            break
+    return pages
+
+
+async def _confluence_search(jira: ToolCallClient, summary: str, limit: int) -> dict:
+    query = confluence_query(summary)
+    if not query:
+        return {"ok": False, "error": "titre vide", "pages": []}
+    # Serveur MCP v2 (mcp.atlassian.com/v2) : `searchConfluence` exige `cql`
+    # (constat exécution 65fe3c32 : « Invalid arguments for tool searchConfluence:
+    # Required at cql ») ; v1 : `searchConfluenceUsingCql`, mêmes arguments.
+    # Un mot-clé suffit à remonter une page (OR) : un mot absent de la doc (ex. la
+    # faute « reopenned » elle-même) ne doit pas tout bloquer ; les pages qui
+    # contiennent le plus de mots sortent en premier (tri par pertinence).
+    cql = "type = page AND (" + " OR ".join(f'text ~ "{w}"' for w in query.split()) + ")"
+    attempts = [
+        ("searchConfluence", {"cloudId": cloud_id(), "cql": cql, "limit": limit}),
+        ("searchConfluenceUsingCql", {"cloudId": cloud_id(), "cql": cql, "limit": limit}),
+    ]
+    last: BaseException | None = None
+    for tool, args in attempts:
+        try:
+            return {"ok": True, "pages": _confluence_pages(await _call(jira, tool, **args), limit)}
+        except Exception as exc:  # outil absent, scopes, réseau : on tente le suivant
+            last = exc
+    return {"ok": False, "error": _exc_text(last)[:300] if last else "", "pages": []}
+
+
+@workflows.activity()
+async def confluence_search(summary: str, limit: int = 3,
+                            jira: ToolCallClient = Depends(atlassian_connector)) -> dict:
+    """Pages Confluence liées au titre du ticket. NON bloquant : en cas d'erreur,
+    {"ok": False, "pages": []} et le pipeline continue."""
+    return await _confluence_search(jira, summary, limit)

@@ -270,7 +270,7 @@ def test_fetch_issue_still_fatal_on_issue_level_mcp_error():
 def test_comment_ok_and_non_blocking_error():
     stub = StubClient({"addCommentToJiraIssue": {"id": "1"}})
     out = asyncio.run(jt._comment(stub, "TOOLLIVE-3600", "hello"))
-    assert out == {"ok": True}
+    assert out == {"ok": True, "id": "1"}
     _, args = stub.calls[0]
     assert args["commentBody"] == "hello" and args["contentFormat"] == "markdown"
     failing = StubClient({}, fail_on=("addCommentToJiraIssue",))
@@ -279,11 +279,54 @@ def test_comment_ok_and_non_blocking_error():
 
 
 def test_transition_by_name():
-    stub = StubClient({"getTransitionsForJiraIssue": TRANSITIONS, "transitionJiraIssue": {}})
+    """Serveur v2 en premier : listJiraIssueTransitions puis transitionJiraIssue(transitionId)."""
+    stub = StubClient({"listJiraIssueTransitions": TRANSITIONS, "transitionJiraIssue": {}})
     out = asyncio.run(jt._transition(stub, "TOOLLIVE-3600", "code-review"))
     assert out["ok"] is True and out["to"] == "code-review"
     tool, args = stub.calls[1]
-    assert tool == "transitionJiraIssue" and args["transition"] == {"id": "61"}
+    assert tool == "transitionJiraIssue" and args["transitionId"] == "61"
+
+
+def test_transition_v1_si_v2_absent():
+    stub = StubClient({"getTransitionsForJiraIssue": TRANSITIONS, "transitionJiraIssue": {}},
+                      errors={"listJiraIssueTransitions": RuntimeError("Unknown tool")})
+    out = asyncio.run(jt._transition(stub, "TOOLLIVE-3600", "code-review"))
+    assert out["ok"] is True
+    assert stub.calls[0][0] == "listJiraIssueTransitions"
+    assert "getTransitionsForJiraIssue" in [c[0] for c in stub.calls]
+
+
+def test_transition_nom_souple_et_statut_toollive():
+    """« devs-en-cours » trouvé par le statut d'arrivée ; « Devs en cours » aussi."""
+    stub = StubClient({"listJiraIssueTransitions": TRANSITIONS, "transitionJiraIssue": {}})
+    out = asyncio.run(jt._transition(stub, "TOOLLIVE-3611", "Devs en cours"))
+    assert out["ok"] is True and out["to"] == "devs-en-cours"
+
+
+def test_transition_indisponible_liste_les_statuts():
+    stub = StubClient({"listJiraIssueTransitions": TRANSITIONS})
+    out = asyncio.run(jt._transition(stub, "TOOLLIVE-3611", "Done"))
+    assert out["ok"] is False
+    assert "disponibles : code-review, devs-en-cours" in out["reason"]
+
+
+def test_transition_erreur_complete_conservee():
+    """Constat 3601-3611 : « connector tool call failed » sans la raison."""
+    class Err(Exception):
+        details = [{"content": [{"type": "text", "text": "MCP error -32602: Required at transitionId"}]}]
+
+    stub = StubClient({"listJiraIssueTransitions": TRANSITIONS},
+                      errors={"transitionJiraIssue": Err("connector tool call failed")})
+    out = asyncio.run(jt._transition(stub, "TOOLLIVE-3611", "code-review"))
+    assert out["ok"] is False and "Required at transitionId" in out["error"]
+
+
+def test_statut_de_demarrage_par_defaut(monkeypatch):
+    monkeypatch.delenv("jira_transition_start", raising=False)
+    monkeypatch.delenv("JIRA_TRANSITION_START", raising=False)
+    assert jt.start_transition_name() == "devs-en-cours"
+    monkeypatch.setenv("jira_transition_start", "Pris en charge")
+    assert jt.start_transition_name() == "Pris en charge"
 
 
 def test_call_falls_back_to_v2_tool_name():
@@ -329,7 +372,7 @@ def test_comment_falls_back_on_mcp_unknown_tool_content_error():
     stub = StubClient({"addOrEditJiraIssueComment": {"id": "1"}},
                       errors={"addCommentToJiraIssue": unknown})
     out = asyncio.run(jt._comment(stub, "TOOLLIVE-3601", "hello"))
-    assert out == {"ok": True}
+    assert out == {"ok": True, "id": "1"}
     assert [c[0] for c in stub.calls] == ["addCommentToJiraIssue", "addOrEditJiraIssueComment"]
 
 
@@ -373,8 +416,7 @@ def test_transition_falls_back_to_v2_transition_id():
     stub = V2Stub()
     out = asyncio.run(jt._transition(stub, "TOOLLIVE-3600", "code-review"))
     assert out["ok"] is True and out["to"] == "code-review"
-    assert [c[0] for c in stub.calls] == ["getTransitionsForJiraIssue", "transitionJiraIssue",
-                                          "transitionJiraIssue"]
+    assert [c[0] for c in stub.calls] == ["listJiraIssueTransitions", "transitionJiraIssue"]
     assert stub.transition_args[-1]["transitionId"] == "61"
 
 
@@ -438,6 +480,100 @@ def test_entrypoint_accepts_jira_issue():
     params = inspect.signature(fn).parameters
     assert "jira_issue" in params
     assert params["jira_issue"].default == ""
+
+
+def test_transitions_via_getjiraissue_expand():
+    """Constat 41167b17 : ni listJiraIssueTransitions ni getTransitionsForJiraIssue
+    n'existent sur le connecteur v2 -> getJiraIssue(expand=transitions)."""
+    unknown = RuntimeError("connector tool call failed\nUnknown tool")
+    issue = {"key": "TOOLLIVE-3611", "fields": {"status": {"name": "Nouveau"}},
+             "transitions": TRANSITIONS["transitions"]}
+    stub = StubClient({"getJiraIssue": issue, "transitionJiraIssue": {}},
+                      errors={"listJiraIssueTransitions": unknown, "getTransitionsForJiraIssue": unknown})
+    out = asyncio.run(jt._transition(stub, "TOOLLIVE-3611", "devs-en-cours"))
+    assert out["ok"] is True and out["to"] == "devs-en-cours"
+    get_calls = [a for t, a in stub.calls if t == "getJiraIssue"]
+    assert get_calls[0]["expand"] == "transitions"
+    assert [a for t, a in stub.calls if t == "transitionJiraIssue"][0]["transitionId"] == "21"
+
+
+def test_transitions_via_executeread():
+    unknown = RuntimeError("Unknown tool")
+    stub = StubClient({"getJiraIssue": {"key": "TOOLLIVE-3611", "fields": {}},
+                       "executeRead": {"result": TRANSITIONS}, "transitionJiraIssue": {}},
+                      errors={"listJiraIssueTransitions": unknown, "getTransitionsForJiraIssue": unknown})
+    out = asyncio.run(jt._transition(stub, "TOOLLIVE-3611", "code-review"))
+    assert out["ok"] is True
+    ex = [a for t, a in stub.calls if t == "executeRead"][0]
+    assert ex["name"] == "listJiraIssueTransitions"
+
+
+def test_transitions_toutes_les_voies_echouent_message_complet():
+    unknown = RuntimeError("Unknown tool")
+    stub = StubClient({}, errors={t: unknown for t in (
+        "listJiraIssueTransitions", "getTransitionsForJiraIssue", "getJiraIssue", "executeRead")})
+    out = asyncio.run(jt._transition(stub, "TOOLLIVE-3611", "code-review"))
+    assert out["ok"] is False
+    for tool in ("listJiraIssueTransitions", "getJiraIssue", "executeRead"):
+        assert tool in out["error"]
+
+
+# ------------------------------------------- commentaire « Suivi » vivant ---
+
+def test_comment_edit_passe_le_comment_id():
+    stub = StubClient({"addOrEditJiraIssueComment": {"id": "777"}})
+    out = asyncio.run(jt._comment(stub, "TOOLLIVE-3611", "v2", comment_id="777"))
+    assert out == {"ok": True, "id": "777"}
+    tool, args = stub.calls[0]
+    assert tool == "addOrEditJiraIssueComment"
+    assert args["commentId"] == "777" and args["commentBody"] == "v2"
+
+
+def test_comment_id_formes_de_reponse():
+    assert jt._comment_id({"id": 12}) == "12"
+    assert jt._comment_id({"comment": {"id": "34"}}) == "34"
+    assert jt._comment_id({"data": {"id": "56"}}) == "56"
+    assert jt._comment_id("Comment 98765 added to TOOLLIVE-3611") == "98765"
+    assert jt._comment_id({"ok": True}) == ""
+
+
+def test_follow_cree_puis_modifie():
+    stub = StubClient({"addCommentToJiraIssue": {"id": "500"},
+                       "addOrEditJiraIssueComment": {"id": "500"}})
+    first = asyncio.run(jt._follow_comment(stub, "TOOLLIVE-3611", "v1"))
+    assert first == {"ok": True, "id": "500", "edited": False}
+    second = asyncio.run(jt._follow_comment(stub, "TOOLLIVE-3611", "v2", first["id"]))
+    assert second == {"ok": True, "id": "500", "edited": True}
+    assert [c[0] for c in stub.calls] == ["addCommentToJiraIssue", "addOrEditJiraIssueComment"]
+
+
+def test_follow_edition_impossible_recree_un_commentaire():
+    stub = StubClient({"addCommentToJiraIssue": {"id": "501"}},
+                      fail_on=("addOrEditJiraIssueComment",))
+    out = asyncio.run(jt._follow_comment(stub, "TOOLLIVE-3611", "v2", "500"))
+    assert out["ok"] and out["id"] == "501" and out["edited"] is False
+    assert "boom" in out["edit_error"]  # la raison du refus reste visible dans Studio
+
+
+def test_follow_retrouve_l_id_sur_le_ticket_si_la_reponse_n_en_a_pas():
+    """Constat TOOLLIVE-3613 (f05f4b8e) : réponse sans id -> 5 commentaires."""
+    issue = {"key": "TOOLLIVE-3613", "fields": {"comment": {"comments": [
+        {"id": "10", "body": "Autre commentaire"},
+        {"id": "11", "body": "🤖 **Pipeline sur TOOLLIVE-3613** Exécution `aaaaaaaa`"},
+        {"id": "12", "body": "🤖 **Pipeline sur TOOLLIVE-3613** Exécution `f05f4b8e`"},
+    ]}}}
+    stub = StubClient({"addCommentToJiraIssue": "Commentaire ajouté",
+                       "getJiraIssue": issue})
+    out = asyncio.run(jt._follow_comment(stub, "TOOLLIVE-3613", "v1", "", "f05f4b8e"))
+    assert out["ok"] and out["id"] == "12"
+    _, args = stub.calls[-1]
+    assert args["fields"] == ["comment"]
+
+
+def test_follow_id_introuvable_reste_vide():
+    stub = StubClient({"addCommentToJiraIssue": "ok", "getJiraIssue": {"key": "K-1", "fields": {}}})
+    out = asyncio.run(jt._follow_comment(stub, "K-1", "v1", "", "f05f4b8e"))
+    assert out["ok"] and out["id"] == ""
 
 
 def test_entrypoint_request_is_optional():

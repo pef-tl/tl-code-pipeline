@@ -93,6 +93,21 @@ notification via `open_approval` (webhook `approval_webhook_url`).
 - Le contenu du ticket (description + commentaires) est prépendu à la demande de
   l'agent spec ; chaque gate est commentée sur le ticket ; à l'ouverture de la
   MR, transition + commentaire avec le lien MR ; commentaire final en sortie.
+- **Workflow JIRA v4 avec gardes** (`activities/jira_workflow.py`, activité
+  `jira_move`) : un statut par phase (Pris en charge → Specs → ready-for-dev →
+  devs-en-cours → Tests auto → code-review ⇄ code-review-in-progress), `blocked`
+  + motif sur toute sortie en échec. Garde côté code : transition absente du
+  tableau v4 ou réservée à un humain sans signal humain explicite → refusée, le
+  ticket ne bouge pas. L'agent ne valide jamais (gates, recette, prod = humains).
+- **Scrutateur JIRA** (workflow `jira-watch`, `workflows/jira_watch.py`) :
+  passage court planifié dans Studio (`python scripts/schedule_watch.py`, défaut
+  toutes les 10 min lun-ven 8h-19h Europe/Paris). JQL `jira_watch_jql` (défaut :
+  `A faire` + étiquette `agent`). Pour chaque ticket : prise « A faire » →
+  « Pris en charge » sous la garde v4 (by_human=False) AVANT de lancer
+  `spec-to-tests` en enfant détaché — le ticket sort de la JQL, jamais deux
+  pipelines sur le même ticket. Repo d'après les étiquettes (`micro` /
+  `microservice` / `c8y`, sinon `jira_watch_default_repo`), résolu via
+  `gitlab_<alias>_repo`. Au plus `max_starts` (2) lancements par passage.
 - **Jamais de credential JIRA dans le code, les logs ni une URL** : résolution
   par la plateforme selon l'identité du run — credential utilisateur en local
   (`mistral dev`) ; **credential `atlassian` au scope workspace requis** pour
@@ -136,7 +151,7 @@ notification via `open_approval` (webhook `approval_webhook_url`).
   reste fatale.
 - Env (minuscules, fallback majuscules) : `jira_base_url` (défaut
   `https://toollive.atlassian.net/jira`), `jira_cloud_id` (UUID ou host du site),
-  `jira_transition_start` (défaut « In Progress »), `jira_transition_review`
+  `jira_transition_start` (défaut « Pris en charge » ; alias `jira_status_start`), `jira_transition_review`
   (défaut « code-review »), `jira_transition_done` (défaut vide = aucune),
   `jira_credentials_name` (nom du credential épinglé par le slot connecteur ;
   vide par défaut = credential par défaut du caller), `jira_connector_name`

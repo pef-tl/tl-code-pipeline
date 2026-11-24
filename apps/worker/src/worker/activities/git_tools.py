@@ -28,6 +28,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import re
 import subprocess
 import tempfile
@@ -35,6 +36,8 @@ import urllib.parse
 import urllib.request
 
 import mistralai.workflows as workflows
+
+from worker.activities.scope_guard import PIPELINE_FILES
 
 
 async def _sh(cmd: list[str], cwd: str, extra_env: dict | None = None) -> dict:
@@ -75,7 +78,10 @@ def extract_url_token(repo: str) -> tuple[str, str | None]:
     return repo, None
 
 
-_TOKEN_ENV_NAMES = ("gitlab_token", "pipeline_git_token")
+# Par ordre de priorité : `pipeline_git_token` (PAT propre à un déploiement, ex.
+# un déploiement de test qui ne peut pas re-binder `gitlab_token`, nom déjà pris)
+# l'emporte sur `gitlab_token` (secret partagé du workspace).
+_TOKEN_ENV_NAMES = ("pipeline_git_token", "gitlab_token")
 
 
 def _token_from_env() -> tuple[str | None, str | None]:
@@ -84,9 +90,10 @@ def _token_from_env() -> tuple[str | None, str | None]:
     nom minuscules conventionnel. Le token est nettoyé (strip) : un secret copié
     depuis un terminal peut embarquer un saut de ligne final, ce qui invaliderait le
     credential Basic. La valeur n'est jamais logguée, seul le nom de la variable."""
-    for key, val in os.environ.items():
-        if key.lower() in _TOKEN_ENV_NAMES and val and val.strip():
-            return val.strip(), key
+    for name in _TOKEN_ENV_NAMES:
+        for key, val in os.environ.items():
+            if key.lower() == name and val and val.strip():
+                return val.strip(), key
     return None, None
 
 
@@ -250,11 +257,39 @@ async def _probe_remote_auth(repo: str) -> None:
         + (f" — {verdict}" if verdict else ""))
 
 
+KEEP_RUN_WORKSPACES = 5
+
+
+def _prune_run_workspaces(root: str, prefix: str, keep: int, current: str) -> list[str]:
+    """Supprime les clones par exécution les plus anciens (même repo), en gardant
+    les `keep` plus récents et le clone courant. Retourne les chemins supprimés."""
+    try:
+        entries = [os.path.join(root, d) for d in os.listdir(root) if d.startswith(prefix)]
+    except FileNotFoundError:
+        return []
+    others = sorted((p for p in entries if os.path.abspath(p) != os.path.abspath(current)
+                     and os.path.isdir(p)), key=os.path.getmtime, reverse=True)
+    removed = []
+    for path in others[max(keep - 1, 0):]:
+        shutil.rmtree(path, ignore_errors=True)
+        # worktrees associés (../worktrees/<nom du clone>)
+        shutil.rmtree(os.path.join(root, "worktrees", os.path.basename(path)), ignore_errors=True)
+        removed.append(path)
+    return removed
+
+
 @workflows.activity()
-async def ensure_workspace(repo: str) -> dict:
+async def ensure_workspace(repo: str, run_id: str = "") -> dict:
     """Si `repo` est une URL (GitLab/GitHub), clone le repo dans un workspace
     local (`pipeline_workspace`, défaut /tmp/pipeline-workspaces) et retourne le
-    chemin. Si c'est un chemin local, le retourne tel quel (mode local)."""
+    chemin. Si c'est un chemin local, le retourne tel quel (mode local).
+
+    `run_id` (fin de l'execution_id) -> un clone PROPRE PAR EXÉCUTION : avant,
+    toutes les exécutions d'un même repo partageaient un dossier (constat
+    TOOLLIVE-3611, exécution 003fd458 : la spec d'un ticket « infobulle » parlait
+    de la faute « reopenned » de TOOLLIVE-3607 — SPEC.md non suivi par git
+    survivait au `reset --hard`, et deux exécutions simultanées se mélangeaient).
+    Les anciens clones sont supprimés (on garde les `KEEP_RUN_WORKSPACES` plus récents)."""
     global _URL_TOKEN
     if not is_url(repo):
         return {"path": repo, "url": None}
@@ -267,7 +302,9 @@ async def ensure_workspace(repo: str) -> dict:
     digest = hashlib.md5(repo.encode()).hexdigest()[:8]
     root = _env("pipeline_workspace", "PIPELINE_WORKSPACE") \
         or os.path.join(tempfile.gettempdir(), "pipeline-workspaces")
-    dest = os.path.join(root, f"{name}-{digest}")
+    dest = os.path.join(root, f"{name}-{digest}" + (f"-{run_id}" if run_id else ""))
+    if run_id:
+        _prune_run_workspaces(root, f"{name}-{digest}-", keep=KEEP_RUN_WORKSPACES, current=dest)
     if os.path.isdir(os.path.join(dest, ".git")):
         await _sh(["git", "fetch", _authed_url(repo), "+refs/heads/*:refs/remotes/origin/*"],
                 dest, extra_env=_git_env())
@@ -318,7 +355,15 @@ async def create_worktree(repo: str, task_id: str) -> dict:
 
 @workflows.activity()
 async def commit_all(worktree: str, message: str) -> dict:
-    res = await _sh(["bash", "-lc", "git add -A && git commit -m \"$1\"", "_", message], worktree)
+    """Commit de tout le worktree SAUF les fichiers du pipeline (SPEC.md) : ils
+    restent locaux et ne doivent jamais partir dans le repo cible (constat
+    TOOLLIVE-3601 / MR !1590 : SPEC.md committé au tour de review)."""
+    excludes = " ".join(f"':(exclude){name}'" for name in PIPELINE_FILES)
+    script = ("git add -A -- . " + excludes
+              + " && for f in " + " ".join(PIPELINE_FILES)
+              + "; do git rm -q --cached --ignore-unmatch \"$f\"; done"
+              + " && git commit -m \"$1\"")
+    res = await _sh(["bash", "-lc", script, "_", message], worktree)
     return res
 
 
@@ -330,6 +375,22 @@ async def merge_branch(repo: str, branch: str) -> dict:
         await _sh(["git", "merge", "--abort"], repo)
         raise RuntimeError(f"merge conflict on {branch}: {res['output']}")
     return res
+
+
+@workflows.activity()
+async def remote_branch_exists(repo: str, branch: str) -> dict:
+    """La branche existe-t-elle déjà sur le remote `origin` ? (constat TOOLLIVE-3607 :
+    relance sur un ticket déjà traité -> même change_id -> push non fast-forward)."""
+    # `origin` est l'URL NETTOYÉE (sans PAT) : sur un GitLab privé, ls-remote
+    # échoue sans authentification -> même URL authentifiée que push_branch.
+    url = (await _sh(["git", "config", "remote.origin.url"], repo))["output"].strip()
+    res = await _sh(["git", "ls-remote", "--heads", _authed_url(url), branch],
+                    repo, extra_env=_git_env())
+    if res["code"] != 0:
+        # Dans le doute (réseau, droits), on considère qu'elle existe : un nom
+        # unique ne coûte rien, un push refusé coûte toute l'exécution.
+        return {"exists": True, "error": _scrub(res["output"])[:300]}
+    return {"exists": bool(res["output"].strip())}
 
 
 @workflows.activity()
@@ -361,8 +422,30 @@ async def push_branch(repo: str, branch: str) -> dict:
 async def diff_against_base(worktree: str) -> dict:
     """Diff de la branche courante contre la branche de base détectée."""
     base = await base_branch(worktree)
-    res = await _sh(["git", "diff", f"{base}...HEAD"], worktree)
+    # Les fusions séquentielles se font sur la branche locale `base` elle-même
+    # (le workspace est en checkout de develop) : `develop...HEAD` est alors VIDE.
+    # On compare donc à la branche distante `origin/<base>` quand elle existe
+    # (constat TOOLLIVE-3604 / MR !1592 : rapport QA « Aucun fichier modifié »).
+    ref = base
+    remote = await _sh(["git", "rev-parse", "--verify", "--quiet", f"origin/{base}"], worktree)
+    if remote["code"] == 0:
+        ref = f"origin/{base}"
+    res = await _sh(["git", "diff", f"{ref}...HEAD"], worktree)
     return {"diff": res["output"], "base": base}
+
+
+@workflows.activity()
+async def read_spec(repo: str) -> dict:
+    """Lit le fichier SPEC.md à la racine du repo/worktree."""
+    spec_path = os.path.join(repo, "SPEC.md")
+    try:
+        with open(spec_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return {"ok": True, "content": content, "path": spec_path}
+    except FileNotFoundError:
+        return {"ok": False, "error": f"SPEC.md introuvable dans {repo}"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 @workflows.activity()

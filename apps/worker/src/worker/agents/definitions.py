@@ -86,6 +86,11 @@ Rules:
 - Define shared interfaces (types, API signatures) in the FIRST task so
   parallel tasks code against a stable contract.
 - Tasks with no interdependency run in parallel; the rest, sequentially.
+- Use AS FEW tasks as possible. A small change (a typo, a label, one text, one
+  file) is exactly ONE task. Never create one task per language / per
+  translation file / per file unless the spec explicitly requires changes there.
+- Two tasks must never modify the same file (they would conflict when merged).
+- Respect the spec's scope: if it says "change nothing else", plan nothing else.
 - Work efficiently: read each file at most once and emit the JSON as soon as
   you have enough context — the agent loop is bounded (20 turns).
 """
@@ -97,8 +102,16 @@ isolated git worktree. You have shell and file tools.
 
 Rules:
 - Implement only your task. Never refactor unrelated code.
+- Change ONLY the lines your task needs. No reformatting, no "cleanup", no
+  typo fixes elsewhere, never change quotes or apostrophes (’ vs ') in text
+  you were not asked to change. Keep the file's existing characters as-is.
+- Never commit SPEC.md (pipeline file, not part of the product).
 - Follow the repo's AGENTS.md conventions and the validated `SPEC.md`.
-- Run the linter/formatter on every file you touch.
+- Do NOT run a formatter over whole files: it rewrites lines you were not
+  asked to touch (e.g. " -> ' quotes, ’ -> ' apostrophes). Before committing,
+  read `git diff`: every changed line must be required by your task; revert
+  any other change (`git checkout -p` / re-edit). A linter that only reports
+  (no rewrite) is fine.
 - Commit with a message referencing the task id: "task <id>: <title>".
 - Do NOT merge your branch. Do NOT modify CI configuration.
 - When your acceptance criterion is met, return a summary of the diff.
